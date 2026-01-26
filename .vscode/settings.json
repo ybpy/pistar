@@ -7,5 +7,7 @@
         "src"
     ],
     "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true
+    "python.testing.pytestEnabled": true,
+    "python.defaultInterpreterPath": "/public/home/chenyuyao1/venv/venv_pi/bin/python",
+    "python.terminal.activateEnvironment": false
 }
