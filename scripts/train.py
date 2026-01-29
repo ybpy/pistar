@@ -147,8 +147,7 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        return model.compute_loss(rng, observation, actions, train=True)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
@@ -203,6 +202,8 @@ def main(config: _config.TrainConfig):
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
+    # Set random seeds for reproducibility
+    np.random.seed(config.seed) # Set numpy random seed for advantage condition dropout
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
 

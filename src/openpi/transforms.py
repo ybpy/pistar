@@ -248,6 +248,7 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    adv_ind_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -259,10 +260,18 @@ class TokenizePrompt(DataTransformFn):
         else:
             state = None
 
+        if self.adv_ind_input:
+            # Use pop to remove adv_ind from data after consuming it
+            if (adv_ind := data.pop("adv_ind", None)) is None:
+                raise ValueError("Adv_ind is required.")
+        else:
+            # Remove adv_ind even if not used, to avoid passing strings to JAX
+            adv_ind = data.pop("adv_ind", None)
+
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state, adv_ind)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

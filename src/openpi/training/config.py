@@ -132,6 +132,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
+                            adv_ind_input=model_config.pistar,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -298,19 +299,36 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        if not model_config.pistar:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "observation/image": "image",
+                            "observation/wrist_image": "wrist_image",
+                            "observation/state": "state",
+                            "actions": "actions",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            )
+        else:
+            repack_transform = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "observation/image": "image",
+                            "observation/wrist_image": "wrist_image",
+                            "observation/state": "state",
+                            "actions": "actions",
+                            "prompt": "prompt",
+                            "adv_ind": "adv_ind", 
+                            # add adv_ind and filter out value, reward, epsilon, adv produced in pistar data processing
+                        }
+                    )
+                ]
+            )
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -742,7 +760,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=True),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -761,6 +779,29 @@ _CONFIGS = [
         # "gs://openpi-assets/checkpoints/pi05_base/params"
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        name="pi05_star_libero",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=True),
+        data=LeRobotLiberoDataConfig(
+            repo_id="ybpy/libero_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=20_000,
         keep_period=10_000,
     ),
     #

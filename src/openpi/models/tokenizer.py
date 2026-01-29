@@ -19,13 +19,21 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize(self, prompt: str, state: np.ndarray | None = None, adv_ind: str | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            if adv_ind is not None:
+                # Advantage dropout: 30% probability of not using adv_ind
+                # Use numpy.random to ensure reproducibility with np.random.seed()
+                if np.random.random() < 0.3:
+                    full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+                else:
+                    full_prompt = f"Task: {cleaned_text}, State: {state_str}, Advantage: {adv_ind};\nAction: "
+            else:
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.

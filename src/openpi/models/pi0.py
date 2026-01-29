@@ -67,6 +67,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.pistar = config.pistar
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -211,7 +212,19 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if not self.pistar:
+            return jnp.mean(jnp.square(v_t - u_t))
+        else:
+            # Compute per-timestep loss: (b, ah)
+            per_timestep_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            # Compute per-sample loss: (b,)
+            per_sample_loss = jnp.mean(per_timestep_loss, axis=-1)
+            # Apply time-based weighting: weight = 0.5 * exp(-0.5*(1-time))
+            # This emphasizes samples with more noise (larger time values)
+            weight = 0.5 * jnp.exp(-0.5 * (1 - time))  # (b,)
+            weighted_loss = per_sample_loss * weight  # (b,)
+            # Return simple average of weighted losses (non-normalized, following original paper)
+            return jnp.mean(weighted_loss)
 
     @override
     def sample_actions(
