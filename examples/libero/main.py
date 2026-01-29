@@ -38,6 +38,11 @@ class Args:
     num_trials_per_task: int = 50  # Number of rollouts per task
 
     #################################################################################################################
+    # PI* specific parameters
+    #################################################################################################################
+    adv_ind_input: str | None = None  # Advantage indicator for inference ("positive" or "negative"). If None, no adv_ind is used.
+
+    #################################################################################################################
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
@@ -139,6 +144,10 @@ def eval_libero(args: Args) -> None:
                             ),
                             "prompt": str(task_description),
                         }
+                        
+                        # Add adv_ind if specified
+                        if args.adv_ind_input is not None:
+                            element["adv_ind"] = args.adv_ind_input
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
