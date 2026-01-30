@@ -229,11 +229,13 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Skip logging when resuming to avoid wandb step mismatch warning
+    if not resuming:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
