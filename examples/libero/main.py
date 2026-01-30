@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
+from typing import Optional
 
 import imageio
 from libero.libero import benchmark
@@ -40,7 +41,8 @@ class Args:
     #################################################################################################################
     # PI* specific parameters
     #################################################################################################################
-    adv_ind_input: str | None = None  # Advantage indicator for inference ("positive" or "negative"). If None, no adv_ind is used.
+    adv_ind_input: Optional[str] = None  # Advantage indicator for inference ("positive" or "negative"). If None, no adv_ind is used.
+    # Usage: python examples/libero/main.py --args.adv_ind_input positive
 
     #################################################################################################################
     # Utils
