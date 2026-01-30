@@ -109,6 +109,8 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # If True, tokenizer will apply dropout to adv_ind during training
+    adv_ind_dropout: bool = True
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -133,6 +135,7 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                             adv_ind_input=model_config.pistar,
+                            adv_ind_dropout=self.adv_ind_dropout,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -288,6 +291,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    adv_ind_dropout: bool = True # Set to True during training to apply adv_ind dropout in model transforms
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -362,7 +366,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
-        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = ModelTransformFactory(adv_ind_dropout=self.adv_ind_dropout)(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -781,6 +785,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         keep_period=10_000,
     ),
+    # Pi05_star model Fine-tuning on Libero Config
     TrainConfig(
         name="pi05_star_libero",
         project_name="pistar",
@@ -789,6 +794,32 @@ _CONFIGS = [
             repo_id="ybpy/libero_pistar",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/public/home/chenyuyao1/model/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=20_000,
+        keep_period=10_000,
+    ),
+    # Pi05_star model Inference on Libero Config
+    TrainConfig(
+        name="pi05_star_libero_infer",
+        project_name="pistar",
+        model=pi0_config.Pi0Config(pi05=True, pistar=True, action_horizon=10, discrete_state_input=True),
+        data=LeRobotLiberoDataConfig(
+            repo_id="ybpy/libero_pistar",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            adv_ind_dropout=False, 
+            # Disable adv_ind dropout during inference
         ),
         batch_size=256,
         lr_schedule=_optimizer.CosineDecaySchedule(
