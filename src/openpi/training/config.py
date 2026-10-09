@@ -92,6 +92,13 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Local dataset root. Used by value training for LeRobot or AgileX HDF5 dirs.
+    local_data_dir: str | None = None
+    # Prompt used when AgileX meta.json instruction is missing / "default".
+    agilex_default_prompt: str | None = None
+    # If set, only keep AgileX episodes whose meta.json if_success is in this set.
+    agilex_filter_if_success: tuple[str, ...] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.

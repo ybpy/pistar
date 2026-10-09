@@ -620,7 +620,21 @@ def create_value_data_loader(
     skip_norm_stats: bool = True,
     framework: Literal["jax", "pytorch"] = "jax",
 ) -> DataLoader[tuple[_model.Observation, jnp.ndarray]]:
-    dataset = create_torch_dataset(data_config, model_config.action_horizon, model_config)
+    from openpi.training.agilex_hdf5_value_dataset import (
+        AgilexHdf5ValueDataset,
+        looks_like_agilex_hdf5_dir,
+    )
+
+    data_root = data_config.local_data_dir or data_config.repo_id
+    if data_root and looks_like_agilex_hdf5_dir(data_root):
+        logging.info(f"Detected AgileX HDF5 value dataset: {data_root}")
+        dataset = AgilexHdf5ValueDataset(
+            data_root,
+            default_prompt=data_config.agilex_default_prompt,
+            filter_if_success=data_config.agilex_filter_if_success,
+        )
+    else:
+        dataset = create_torch_dataset(data_config, model_config.action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     sampler = None

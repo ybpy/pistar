@@ -168,10 +168,17 @@ def build_value_data_config(
     config: ValueModelConfig,
     *,
     tokenizer_path: str | None,
+    default_prompt: str | None = None,
+    filter_if_success: tuple[str, ...] | None = None,
 ) -> _config.DataConfig:
+    from openpi.training.agilex_hdf5_value_dataset import looks_like_agilex_hdf5_dir
+
+    is_hdf5 = looks_like_agilex_hdf5_dir(local_data_dir)
     return _config.DataConfig(
         local_data_dir=local_data_dir,
-        prompt_from_task=True,
+        prompt_from_task=not is_hdf5,
+        agilex_default_prompt=default_prompt,
+        agilex_filter_if_success=filter_if_success,
         data_transforms=_transforms.Group(
             inputs=[RemapValueLabelKey(), value_policy.ValueInputs()],
         ),
@@ -468,7 +475,25 @@ def save_checkpoint(state: TrainState, checkpoint_dir: Path, step: int):
 
 def main():
     parser = argparse.ArgumentParser(description="训练 Value Function")
-    parser.add_argument("--data_dir", type=str, required=True, help="LeRobot 数据集路径")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="LeRobot 数据集路径，或转换后的 AgileX HDF5 根目录（自动识别 episode.hdf5）",
+    )
+    parser.add_argument(
+        "--default_prompt",
+        type=str,
+        default=None,
+        help="AgileX HDF5 默认任务文本（meta.json instruction 为空或 default 时使用）",
+    )
+    parser.add_argument(
+        "--filter_if_success",
+        nargs="+",
+        default=None,
+        metavar="STATUS",
+        help="只使用这些 if_success 的 AgileX episode，例如: --filter_if_success take_over fail",
+    )
     parser.add_argument("--val_data_dir", type=str, default=None, help="可选的验证集路径")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Checkpoint 保存路径")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
@@ -608,10 +633,13 @@ def main():
 
     _validate_gemma_tokenizer(resolved_tokenizer_path)
 
+    filter_if_success = tuple(args.filter_if_success) if args.filter_if_success else None
     data_config = build_value_data_config(
         args.data_dir,
         config,
         tokenizer_path=resolved_tokenizer_path,
+        default_prompt=args.default_prompt,
+        filter_if_success=filter_if_success,
     )
 
     data_loader = _data_loader.create_value_data_loader(
@@ -639,12 +667,26 @@ def main():
                 args.val_data_dir,
                 config,
                 tokenizer_path=resolved_tokenizer_path,
+                default_prompt=args.default_prompt,
+                filter_if_success=filter_if_success,
             )
-            val_dataset = _data_loader.create_torch_dataset(
-                val_data_config,
-                config.action_horizon,
-                config,
+            from openpi.training.agilex_hdf5_value_dataset import (
+                AgilexHdf5ValueDataset,
+                looks_like_agilex_hdf5_dir,
             )
+
+            if looks_like_agilex_hdf5_dir(args.val_data_dir):
+                val_dataset = AgilexHdf5ValueDataset(
+                    args.val_data_dir,
+                    default_prompt=args.default_prompt,
+                    filter_if_success=filter_if_success,
+                )
+            else:
+                val_dataset = _data_loader.create_torch_dataset(
+                    val_data_config,
+                    config.action_horizon,
+                    config,
+                )
             val_dataset_size = len(val_dataset)
             if val_dataset_size < effective_batch_size:
                 raise ValueError(
