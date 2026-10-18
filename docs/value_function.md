@@ -255,7 +255,7 @@ python3 /public/home/wangsenbao_it/litianheng/openpi/scripts/train_value.py \
     --checkpoint_dir ./checkpoints/value_model \
     --batch_size 64 \
     --num_train_steps 10000 \
-    --val_interval 100 \
+    --val_interval 5000 \
     --load_pretrained
 ```
 
@@ -418,3 +418,56 @@ python scripts/label_advantage_from_vlm.py \
   --lookahead 50 \
   --batch_size 8
 ```
+
+
+## 1-3 camera value training and inference
+
+The value backbone shares the same SigLIP weights for each view. Camera selection
+adds no learned parameters. The input adapter now retains left and right wrist
+images independently, and cross-attention respects missing-view masks.
+
+Select cameras using `--camera_names` in both `scripts/train_value.py` and
+`scripts/label_advantage_from_vlm.py` (including its HDF5 multi-GPU mode):
+
+```bash
+# Add one of these to the existing value training/inference command:
+--camera_names head                 # one camera
+--camera_names head left            # two; unchanged default for legacy checkpoints
+--camera_names head right           # head plus right wrist
+--camera_names head left right      # three
+```
+
+Any 1-3 distinct names from `head`, `left`, `right` are accepted. Their order is
+canonicalized. `left` retains the historical model key `wrist_0_rgb`; `right` uses
+`right_wrist_0_rgb`. A selected missing stream is zero-filled with mask=False;
+no available selected images is an error. The legacy wrist-only-to-head fallback
+is retained when head is requested.
+
+Python configuration and input transformation:
+
+```python
+from openpi.models.value_model_config import ValueModelConfig
+from openpi.policies.value_policy import ValueInputs
+config = ValueModelConfig(camera_names=("head", "left", "right"))
+inputs = ValueInputs(camera_names=config.camera_names)
+# Inputs accept cam_high / cam_left_wrist / cam_right_wrist, or
+# image / wrist_image / right_wrist_image, with nested or flattened keys.
+```
+
+Training writes `value_camera_config.json` to the experiment directory and each
+saved step directory. Inference reads it automatically unless explicitly
+overridden with `--camera_names`; old checkpoints without it default to head+left.
+LeRobot inference can specify `--base_image_col`, `--wrist_image_col`, and
+`--right_wrist_image_col` for custom column names. The default right column when
+right is selected is `right_wrist_image`. Never substitute a copied wrist image
+for a real third camera unless the explicit legacy `--copy_wrist_to_right` option
+is intentional.
+
+Use a new checkpoint directory when changing camera layout. The input schema is
+recorded to prevent mixing different layouts in one training run or resumed
+HDF5 inference cache. Existing model weights remain loadable, but a two-view
+checkpoint has not been trained to use the additional right view; evaluate or
+fine-tune with the chosen layout before relying on its scores. Existing dataset
+labels and model checkpoints are not rewritten by this code change.
+
+Focused checks: `python -m pytest -q scripts/test_value_multicamera.py`.

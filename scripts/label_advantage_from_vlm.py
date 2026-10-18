@@ -453,77 +453,32 @@ class LabelAdvantageInputs(_transforms.DataTransformFn):
     copy_wrist_to_right: bool
     instruction_col: str | None
     tasks_map: dict[int, str] | None
+    camera_names: tuple[str, ...] | None = None
 
     def __call__(self, data: dict[str, Any]) -> dict[str, Any]:
         prompt = self._extract_prompt(data)
-        base_raw = _get_first(data, _column_candidates(self.base_image_col), required=False, name="base_image")
-        wrist_image = None
-        wrist_raw = None
-        if self.wrist_image_col:
-            wrist_raw = _get_first(data, _column_candidates(self.wrist_image_col), required=False, name="wrist_image")
-            if wrist_raw is not None and not (isinstance(wrist_raw, float) and np.isnan(wrist_raw)):
-                wrist_image = _parse_image(wrist_raw)
-
-        has_base = base_raw is not None and not (isinstance(base_raw, float) and np.isnan(base_raw))
-        if not has_base and wrist_image is None:
-            raise KeyError(
-                f"Missing base_image. Tried keys: {_column_candidates(self.base_image_col)}. "
-                f"Fallback wrist_image keys: {_column_candidates(self.wrist_image_col) if self.wrist_image_col else []}. "
-                f"Available top-level keys: {list(data.keys())}"
-            )
-
-        # 单相机数据集：没有 base_image 时，退化为把 wrist_image 当作唯一视觉输入。
-        if has_base:
-            base_image = _parse_image(base_raw)
-            use_wrist = wrist_image is not None
-        else:
-            base_image = wrist_image
-            wrist_image = None
-            use_wrist = False
-
-        right_image = None
-        if self.right_wrist_image_col:
-            right_raw = _get_first(
-                data,
-                _column_candidates(self.right_wrist_image_col),
-                required=False,
-                name="right_wrist_image",
-            )
-            if right_raw is not None and not (isinstance(right_raw, float) and np.isnan(right_raw)):
-                right_image = _parse_image(right_raw)
-
-        if right_image is None and self.copy_wrist_to_right and wrist_image is not None:
-            right_image = wrist_image
-
-        state = _get_first(
-            data,
-            ["state", "observation/state", "observation.state"],
-            required=False,
-            name="state",
-        )
-        if state is None:
-            state = np.zeros((1,), dtype=np.float32)
-
-        result: dict[str, Any] = {
-            "state": state,
-            "prompt": prompt,
-            "image": {"base_0_rgb": base_image},
-            "image_mask": {"base_0_rgb": np.True_},
-        }
-
-        if use_wrist and wrist_image is not None:
-            result["image"]["wrist_0_rgb"] = wrist_image
-            result["image_mask"]["wrist_0_rgb"] = np.True_
-        elif self.wrist_image_col is not None:
-            result["image"]["wrist_0_rgb"] = np.zeros_like(base_image)
-            result["image_mask"]["wrist_0_rgb"] = np.False_
-
-        if right_image is not None:
-            result["image"]["right_wrist_0_rgb"] = right_image
-            result["image_mask"]["right_wrist_0_rgb"] = np.True_
-        elif self.right_wrist_image_col is not None or self.copy_wrist_to_right:
-            result["image"]["right_wrist_0_rgb"] = np.zeros_like(base_image)
-            result["image_mask"]["right_wrist_0_rgb"] = np.False_
+        from openpi.policies.value_policy import ValueInputs
+        from openpi.shared.value_cameras import CAMERA_DATA_KEYS, image_is_present
+        names = self.camera_names
+        if names is None:
+            names = ("head", "left", "right") if self.right_wrist_image_col or self.copy_wrist_to_right else ("head", "left")
+        sample = {"prompt": prompt, "value": np.float32(0)}
+        raw = {}
+        for name, column in (("head", self.base_image_col), ("left", self.wrist_image_col),
+                             ("right", self.right_wrist_image_col)):
+            if column:
+                value = _get_first(data, _column_candidates(column), required=False, name=name)
+                if image_is_present(value):
+                    raw[name] = value
+        if self.copy_wrist_to_right and "right" not in raw and "left" in raw:
+            raw["right"] = raw["left"]
+        for name, value in raw.items():
+            sample[f"observation.images.{CAMERA_DATA_KEYS[name]}"] = value
+        state = _get_first(data, ["state", "observation/state", "observation.state"], required=False, name="state")
+        if state is not None:
+            sample["state"] = state
+        result = ValueInputs(camera_names=names)(sample)
+        result.pop("value")
 
         for meta_key in ("episode_index", "frame_index", "index"):
             value = _get_first(data, _column_candidates(meta_key), required=False, name=meta_key)
@@ -720,6 +675,7 @@ def _build_inference_dataset(
                     copy_wrist_to_right=copy_wrist_to_right,
                     instruction_col=instruction_col,
                     tasks_map=tasks_map,
+                    camera_names=model_config.camera_names,
                 )
             ]
         ),
@@ -971,12 +927,8 @@ def _build_pending_label_requests(
 
 
 def main() -> None:
-    import jax
-    import jax.numpy as jnp
-    from openpi.models.value_model_config import ValueModelConfig
-
     parser = argparse.ArgumentParser(description="Label advantage indicators using the VLM value model")
-    parser.add_argument("--data_dir", type=str, required=True, help="LeRobot 数据集路径")
+    parser.add_argument("--data_dir", type=str, nargs="+", required=True, help="LeRobot 数据集或 AgileX HDF5 根目录")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Checkpoint directory containing step_*")
     parser.add_argument("--checkpoint_name", type=str, default=None, help="Specific checkpoint folder name")
     parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=True, help="Use EMA params if present")
@@ -1001,6 +953,8 @@ def main() -> None:
     parser.add_argument("--human_col", type=str, default="intervention", help="Human intervention flag column name (default: 'intervention')")
     parser.add_argument("--instruction_col", type=str, default=None, help="Instruction/prompt column name to read")
     parser.add_argument("--adv_col", type=str, default="adv_ind", help="Advantage indicator column name to create")
+    parser.add_argument("--camera_names", nargs="+", choices=("head", "left", "right"), default=None,
+                        help="1-3 cameras; read checkpoint camera metadata, otherwise legacy head+left")
     parser.add_argument("--base_image_col", type=str, default="image", help="Base image column name")
     parser.add_argument("--wrist_image_col", type=str, default="wrist_image", help="Wrist image column name")
     parser.add_argument("--right_wrist_image_col", type=str, default=None, help="Right wrist image column name")
@@ -1010,9 +964,30 @@ def main() -> None:
         default=False,
         help="If true and right wrist is missing, copy wrist image",
     )
+    parser.add_argument("--num_shards", type=int, default=None, help="HDF5 推理使用的 GPU 数")
+    parser.add_argument("--infer_shard", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--frame_start", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--frame_end", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--resume", action="store_true", help="沿用已有 values.dat，只补未完成的帧并写 adv_ind")
+    parser.add_argument("--work_dir", type=str, default="/tmp/adv_ind_hdf5", help="HDF5 推理中间文件目录")
     args = parser.parse_args()
     if not 0.0 < args.top_percent <= 100.0:
         parser.error("--top_percent must be in (0, 100]")
+
+    from openpi.training.agilex_hdf5_value_dataset import looks_like_agilex_hdf5_dirs
+
+    if looks_like_agilex_hdf5_dirs(args.data_dir):
+        import label_advantage_hdf5
+
+        label_advantage_hdf5.run(args)
+        return
+    if len(args.data_dir) != 1:
+        raise ValueError("LeRobot 模式只接受一个 data_dir")
+    args.data_dir = args.data_dir[0]
+
+    import jax
+    import jax.numpy as jnp
+    from openpi.models.value_model_config import ValueModelConfig
 
     logging.basicConfig(level=logging.INFO, force=True)
     cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
@@ -1047,7 +1022,13 @@ def main() -> None:
     checkpoint_path = _resolve_checkpoint_path(Path(args.checkpoint_dir), args.checkpoint_name)
     LOG.info("Using checkpoint: %s", checkpoint_path)
 
-    config = ValueModelConfig()
+    from openpi.shared.value_cameras import resolve_camera_names
+    names = resolve_camera_names(args.camera_names, checkpoint_path,
+        default=("head", "left", "right") if args.right_wrist_image_col or args.copy_wrist_to_right else ("head", "left"))
+    config = ValueModelConfig(camera_names=names)
+    if "right" in names and args.right_wrist_image_col is None:
+        args.right_wrist_image_col = "right_wrist_image"
+    LOG.info("Value cameras: %s", names)
     params = _load_checkpoint_params(checkpoint_path, use_ema=args.use_ema)
     model = config.load(params, remove_extra_params=True)
 

@@ -19,8 +19,6 @@ import contextlib
 import dataclasses
 import functools
 
-from etils import edc
-from etils.edc import ContextStack
 from etils.epy import _internal
 from flax import linen as nn
 import jax
@@ -34,17 +32,16 @@ class _DTypeState:
   exclude: list[str] | None
 
 
-try:
-  _ContextStack = edc.ContextStack
-except AttributeError:
-  class _ContextStack(list):
-    @property
-    def stack(self) -> "_ContextStack":
-      return self
+class _ContextStack(list):
+  def __class_getitem__(cls, item):
+    return cls
 
-  _ContextStack = _ContextStack
+  @property
+  def stack(self) -> "_ContextStack":
+    return self
 
-_dtypes_stack = _ContextStack[_DTypeState]()
+
+_dtypes_stack = _ContextStack()
 
 
 @contextlib.contextmanager
@@ -99,7 +96,7 @@ def _mock_flax_module_param() -> None:
 def _should_replace_dtype(
     *,
     module: nn.Module,
-    stack: edc.ContextStack[_DTypeState],
+    stack: _ContextStack,
 ) -> bool:
   """Whether or not the dtype should be replaced."""
   if not module.is_initializing() or not stack:

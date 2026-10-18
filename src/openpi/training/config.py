@@ -92,8 +92,8 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
-    # Local dataset root. Used by value training for LeRobot or AgileX HDF5 dirs.
-    local_data_dir: str | None = None
+    # Local dataset root, or several AgileX HDF5 roots. Used by value training.
+    local_data_dir: str | tuple[str, ...] | None = None
     # Prompt used when AgileX meta.json instruction is missing / "default".
     agilex_default_prompt: str | None = None
     # If set, only keep AgileX episodes whose meta.json if_success is in this set.

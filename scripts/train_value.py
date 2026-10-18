@@ -18,12 +18,15 @@ if os.getenv("OPENPI_SILENCE_TF", "1") != "0":
     os.environ.setdefault("GLOG_minloglevel", "3")
 
 import argparse
+from collections.abc import Sequence
 import dataclasses
 import functools
+import json
 import logging
 from pathlib import Path
 import platform
 import sys
+import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
@@ -111,6 +114,7 @@ class GemmaValueTokenizer:
         self._max_len = max_len
         self._tokenizer_path = tokenizer_path
         self._tokenizer = None
+        self._token_cache = {}
 
     def _get_tokenizer(self):
         if self._tokenizer is not None:
@@ -131,22 +135,35 @@ class GemmaValueTokenizer:
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_tokenizer"] = None
+        state["_token_cache"] = {}
         return state
 
-    def tokenize(self, prompt: str, state: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
-        del state
+    def tokenize(self, prompt: str, state: jnp.ndarray | None = None,
+                 adv_ind: str | None = None, *, adv_ind_dropout: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+        del state, adv_ind_dropout
+        if adv_ind is not None:
+            raise ValueError("Value-model tokenizer does not support advantage-indicator prompts")
 
-        tokenizer = self._get_tokenizer()
         text = f"{str(prompt).rstrip()}\nValue:"
+        # Keep pickled tokenizers from an already-running job compatible.
+        if not hasattr(self, "_token_cache"):
+            self._token_cache = {}
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached[0].copy(), cached[1].copy()
+        tokenizer = self._get_tokenizer()
         tokens = tokenizer.encode(text, add_bos=True, add_eos=False)
         if len(tokens) > self._max_len:
             tokens = tokens[: self._max_len]
         else:
             tokens = tokens + [0] * (self._max_len - len(tokens))
 
-        tokens = jnp.asarray(tokens, dtype=jnp.int32)
+        tokens = np.asarray(tokens, dtype=np.int32)
         mask = tokens != 0
-        return tokens, mask
+        if len(self._token_cache) >= 256:
+            self._token_cache.pop(next(iter(self._token_cache)))
+        self._token_cache[text] = (tokens, mask)
+        return tokens.copy(), mask.copy()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,8 +180,15 @@ class RemapValueLabelKey(_transforms.DataTransformFn):
         return remapped
 
 
+def normalize_data_dirs(local_data_dir: str | Sequence[str]) -> str | tuple[str, ...]:
+    dirs = (local_data_dir,) if isinstance(local_data_dir, str) else tuple(local_data_dir)
+    if not dirs:
+        raise ValueError("data_dir 为空")
+    return dirs[0] if len(dirs) == 1 else dirs
+
+
 def build_value_data_config(
-    local_data_dir: str,
+    local_data_dir: str | Sequence[str],
     config: ValueModelConfig,
     *,
     tokenizer_path: str | None,
@@ -173,14 +197,20 @@ def build_value_data_config(
 ) -> _config.DataConfig:
     from openpi.training.agilex_hdf5_value_dataset import looks_like_agilex_hdf5_dir
 
-    is_hdf5 = looks_like_agilex_hdf5_dir(local_data_dir)
+    dirs = (local_data_dir,) if isinstance(local_data_dir, str) else tuple(local_data_dir)
+    if not dirs:
+        raise ValueError("data_dir 为空")
+    hdf5_flags = [looks_like_agilex_hdf5_dir(path) for path in dirs]
+    if any(hdf5_flags) and not all(hdf5_flags):
+        raise ValueError("data_dir 里同时包含 AgileX HDF5 和 LeRobot 数据集，不能放在同一次训练里")
+    is_hdf5 = all(hdf5_flags)
     return _config.DataConfig(
-        local_data_dir=local_data_dir,
+        local_data_dir=normalize_data_dirs(dirs),
         prompt_from_task=not is_hdf5,
         agilex_default_prompt=default_prompt,
         agilex_filter_if_success=filter_if_success,
         data_transforms=_transforms.Group(
-            inputs=[RemapValueLabelKey(), value_policy.ValueInputs()],
+            inputs=[RemapValueLabelKey(), value_policy.ValueInputs(camera_names=config.camera_names)],
         ),
         model_transforms=_transforms.Group(
             inputs=[
@@ -289,11 +319,11 @@ def create_train_state(
     rng: at.KeyArrayLike,
     load_pretrained: bool = False,
     ema_decay: float = 0.99,
-    peak_lr: float = 2.5e-5,
-    decay_lr: float = 2.5e-6,
+    peak_lr: float = 5e-6,
+    decay_lr: float = 5e-7,
     warmup_steps: int | None = None,
     grad_clip_norm: float = 1.0,
-    freeze_mode: str = "all_backbones",
+    freeze_mode: str = "none",
 ) -> tuple[TrainState, optax.GradientTransformation, optax.Schedule]:
     """创建训练状态。"""
     model = config.create(rng)
@@ -352,7 +382,8 @@ def train_step(
     observation: _model.Observation,
     target: jnp.ndarray,
     ema_decay: float = 0.99,
-    freeze_mode: str = "all_backbones",
+    freeze_mode: str = "none",
+    log_param_norms: bool = True,
 ) -> tuple[TrainState, dict[str, jnp.ndarray]]:
     """单步训练。"""
     model = nnx.merge(state.model_def, state.params)
@@ -389,16 +420,20 @@ def train_step(
         ema_params=new_ema_params,
     )
 
-    info = {
-        "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "siglip_param_norm": _kernel_param_norm(full_params, _make_group_filter("siglip")),
-        "trainable_param_norm": _kernel_param_norm(full_params, trainable_filter),
-        "llm_param_norm": _kernel_param_norm(full_params, _make_group_filter("llm")),
-        "head_param_norm": _kernel_param_norm(full_params, _make_group_filter("head")),
-    }
+    info = {"loss": loss, "grad_norm": optax.global_norm(grads)}
+    if log_param_norms:
+        info.update(parameter_norms(full_params, freeze_mode))
 
     return new_state, info
+
+
+def parameter_norms(params: nnx.State, freeze_mode: str) -> dict[str, jnp.ndarray]:
+    return {
+        "siglip_param_norm": _kernel_param_norm(params, _make_group_filter("siglip")),
+        "trainable_param_norm": _kernel_param_norm(params, _make_trainable_filter(freeze_mode)),
+        "llm_param_norm": _kernel_param_norm(params, _make_group_filter("llm")),
+        "head_param_norm": _kernel_param_norm(params, _make_group_filter("head")),
+    }
 
 
 def eval_step(
@@ -447,7 +482,7 @@ def load_checkpoint(checkpoint_path: Path, state: TrainState) -> TrainState:
     return state
 
 
-def save_checkpoint(state: TrainState, checkpoint_dir: Path, step: int):
+def save_checkpoint(state: TrainState, checkpoint_dir: Path, step: int, *, camera_names=("head", "left")):
     """保存 checkpoint。"""
     import orbax.checkpoint as ocp
 
@@ -470,22 +505,25 @@ def save_checkpoint(state: TrainState, checkpoint_dir: Path, step: int):
         
         ckptr.save(str(ckpt_path), save_dict)
 
+    from openpi.shared.value_cameras import write_camera_config
+    write_camera_config(ckpt_path, camera_names)
     logging.info(console.ok(f"保存 checkpoint: {ckpt_path}"))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="训练 Value Function")
+    parser = argparse.ArgumentParser(description="训练 Value Function", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument(
         "--data_dir",
         type=str,
+        nargs="+",
         required=True,
-        help="LeRobot 数据集路径，或转换后的 AgileX HDF5 根目录（自动识别 episode.hdf5）",
+        help="一个或多个数据集路径。LeRobot 只能传一个；AgileX HDF5 可传多个根目录，每个目录单独扫描 episode.hdf5",
     )
     parser.add_argument(
         "--default_prompt",
         type=str,
         default=None,
-        help="AgileX HDF5 默认任务文本（meta.json instruction 为空或 default 时使用）",
+        help="AgileX HDF5 两行条码 prompt。扫码帧及之前用第一行，之后按条码填 item/color/basket。只传一行时改用 pi0.5 默认两行模板",
     )
     parser.add_argument(
         "--filter_if_success",
@@ -494,13 +532,28 @@ def main():
         metavar="STATUS",
         help="只使用这些 if_success 的 AgileX episode，例如: --filter_if_success take_over fail",
     )
-    parser.add_argument("--val_data_dir", type=str, default=None, help="可选的验证集路径")
+    parser.add_argument(
+        "--val_data_dir",
+        type=str,
+        nargs="+",
+        default=None,
+        help="可选的验证集路径，AgileX HDF5 可传多个根目录",
+    )
+    parser.add_argument("--val_fraction", type=float, default=0.01,
+                        help="未指定 val_data_dir 时按完整 episode 留出的验证比例，0 表示关闭自动划分")
+    parser.add_argument("--camera_names", nargs="+", choices=("head", "left", "right"),
+                        default=("head", "left"), help="Select 1-3 value cameras; default preserves head+left")
+    parser.add_argument("--dropout_rate", type=float, default=0.1,
+                        help="ValueHead 训练 dropout 概率，验证时关闭")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Checkpoint 保存路径")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_train_steps", type=int, default=30000, help="训练步数")
     parser.add_argument("--log_interval", type=int, default=100, help="日志间隔")
-    parser.add_argument("--val_interval", type=int, default=100, help="验证间隔步数，<=0 表示禁用验证")
+    parser.add_argument("--val_interval", type=int, default=5000, help="验证间隔步数，<=0 表示禁用验证")
     parser.add_argument("--save_interval", type=int, default=1000, help="保存间隔")
+    parser.add_argument("--loader_prefetch_factor", type=int, default=4, help="每个 CPU worker 提前准备的 batch 数")
+    parser.add_argument("--prefetch_batches", type=int, default=3, help="后台持续预取的 batch 数，0 表示关闭")
+    parser.add_argument("--episode_block_size", type=int, default=16, help="episode 内随机小块大小，0 恢复逐帧全局随机")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader worker 数量（参考 openpi 默认值）")
     parser.add_argument("--wandb_project", type=str, default="openpi", help="Weights & Biases project")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity/team")
@@ -515,19 +568,30 @@ def main():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="从指定checkpoint恢复训练（例如：step_00001000）")
     parser.add_argument("--pyarrow_num_threads", type=int, default=0, help="PyArrow 读取并行线程数，0表示不设置")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="可选的 Gemma3 tokenizer.model 本地路径")
-    parser.add_argument("--peak_lr", type=float, default=2.5e-5, help="学习率峰值")
-    parser.add_argument("--decay_lr", type=float, default=2.5e-6, help="余弦衰减结束学习率")
+    parser.add_argument("--peak_lr", type=float, default=5e-6, help="学习率峰值")
+    parser.add_argument("--decay_lr", type=float, default=5e-7, help="余弦衰减结束学习率")
     parser.add_argument("--warmup_steps", type=int, default=None, help="warmup 步数，默认取 min(1000, num_train_steps//10)")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="全局梯度裁剪阈值")
     parser.add_argument(
         "--freeze_mode",
         type=str,
         choices=FREEZE_MODES,
-        default="all_backbones",
+        default="none",
         help="冻结策略: none=全量训练, siglip_only=只冻结SigLIP, all_backbones=冻结SigLIP和Gemma backbone",
     )
     args = parser.parse_args()
+    from openpi.shared.value_cameras import normalize_camera_names
+    try:
+        args.camera_names = normalize_camera_names(args.camera_names)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not 0.0 <= args.val_fraction < 1.0:
+        parser.error("val_fraction must be in [0, 1)")
+    if not 0.0 <= args.dropout_rate < 1.0:
+        parser.error("dropout_rate must be in [0, 1)")
 
+    if args.loader_prefetch_factor <= 0 or args.prefetch_batches < 0 or args.episode_block_size < 0:
+        parser.error("loader_prefetch_factor must be positive; prefetch_batches and episode_block_size must be nonnegative")
     init_logging()
     logging.info(f"\033[1;34;46mRunning on:\033[0m \033[1;33;40m{platform.node()}\033[0m")
 
@@ -575,7 +639,13 @@ def main():
     config = ValueModelConfig(
         gemma_variant=args.gemma_variant,
         siglip_variant=args.siglip_variant,
+        dropout_rate=args.dropout_rate,
+        camera_names=tuple(args.camera_names),
     )
+
+    from openpi.shared.value_cameras import write_camera_config
+    write_camera_config(Path(args.checkpoint_dir), config.camera_names)
+    logging.info("Value cameras: %s", config.camera_names)
 
     wandb_run = None
     if args.wandb_mode != "disabled":
@@ -642,85 +712,118 @@ def main():
         filter_if_success=filter_if_success,
     )
 
-    data_loader = _data_loader.create_value_data_loader(
-        data_config,
-        model_config=config,
-        batch_size=effective_batch_size,
-        sharding=data_sharding,
-        shuffle=True,
-        num_workers=max_workers,
-        seed=args.seed,
-        skip_norm_stats=True,
-        framework="jax",
+    from openpi.training.agilex_hdf5_value_dataset import (
+        AgilexHdf5ValueDataset,
+        looks_like_agilex_hdf5_dirs,
     )
-    logging.info(console.info(f"数据集大小: {len(data_loader.dataset)} 帧"))
+
+    raw_train = None
+    raw_val = None
+    val_data_config = data_config
+    if looks_like_agilex_hdf5_dirs(args.data_dir):
+        raw_train = AgilexHdf5ValueDataset(
+            args.data_dir, default_prompt=args.default_prompt, filter_if_success=filter_if_success,
+            camera_names=config.camera_names,
+        )
+    if args.val_interval > 0:
+        if args.val_data_dir:
+            val_data_config = build_value_data_config(
+                args.val_data_dir, config, tokenizer_path=resolved_tokenizer_path,
+                default_prompt=args.default_prompt, filter_if_success=filter_if_success,
+            )
+            if looks_like_agilex_hdf5_dirs(args.val_data_dir):
+                raw_val = AgilexHdf5ValueDataset(
+                    args.val_data_dir, default_prompt=args.default_prompt, filter_if_success=filter_if_success,
+                    camera_names=config.camera_names,
+                )
+            else:
+                raw_val = _data_loader.create_torch_dataset(val_data_config, config.action_horizon, config)
+        elif args.val_fraction > 0:
+            if raw_train is None:
+                raise ValueError("Automatic episode validation split requires AgileX HDF5; "
+                                 "provide --val_data_dir or explicitly set --val_fraction 0")
+            previous_split_path = Path(args.checkpoint_dir) / "validation_split.json"
+            validation_paths = None
+            if previous_split_path.exists():
+                previous = json.loads(previous_split_path.read_text())
+                known_paths = set(previous["train_episodes"]) | set(previous["val_episodes"])
+                current_paths = {str(ep["hdf5_path"].resolve()) for ep in raw_train.episodes}
+                if (previous.get("seed") == args.seed and previous.get("val_fraction") == args.val_fraction
+                        and current_paths <= known_paths):
+                    validation_paths = previous["val_episodes"]
+            raw_train, raw_val = raw_train.split_by_episode(args.val_fraction, args.seed, validation_paths)
+    else:
+        logging.info(console.warn("val_interval<=0: validation disabled"))
+
+    if isinstance(raw_train, AgilexHdf5ValueDataset) and isinstance(raw_val, AgilexHdf5ValueDataset):
+        train_paths = [str(ep["hdf5_path"].resolve()) for ep in raw_train.episodes]
+        val_paths = [str(ep["hdf5_path"].resolve()) for ep in raw_val.episodes]
+        overlap = set(train_paths) & set(val_paths)
+        if overlap:
+            raise ValueError(f"Training/validation episode overlap: {len(overlap)} (sample: {sorted(overlap)[:3]})")
+        manifest = {"seed": args.seed, "val_fraction": args.val_fraction,
+                    "train_episodes": train_paths, "val_episodes": val_paths}
+        manifest_path = Path(args.checkpoint_dir) / "validation_split.json"
+        excluded = {item["path"]: item for dataset in (raw_train, raw_val)
+                    for item in dataset.excluded_prompt_episodes}
+        if manifest_path.exists():
+            previous = json.loads(manifest_path.read_text())
+            if previous != manifest:
+                removed = ((set(previous["train_episodes"]) - set(train_paths))
+                           | (set(previous["val_episodes"]) - set(val_paths)))
+                safe_exclusion = (
+                    previous.get("seed") == args.seed and previous.get("val_fraction") == args.val_fraction
+                    and set(train_paths) <= set(previous["train_episodes"])
+                    and set(val_paths) <= set(previous["val_episodes"])
+                    and removed <= set(excluded)
+                )
+                if not safe_exclusion:
+                    raise ValueError("Existing validation split differs; use a separate checkpoint_dir for this experiment")
+                backup_manifest = manifest_path.with_name("validation_split.before-barcode-repair-20261011.json")
+                if not backup_manifest.exists():
+                    backup_manifest.write_text(manifest_path.read_text())
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        if excluded:
+            exclusion_path = manifest_path.with_name("excluded_prompt_episodes.json")
+            exclusion_path.write_text(json.dumps(list(excluded.values()), indent=2) + "\n")
+            logging.warning(console.warn(f"Excluded {len(excluded)} episodes with invalid prompt metadata; report: {exclusion_path}"))
+        logging.info(console.info(f"Episode split manifest: {manifest_path}"))
+
+    data_loader = _data_loader.create_value_data_loader(
+        data_config, model_config=config, batch_size=effective_batch_size,
+        sharding=data_sharding, shuffle=True, num_workers=max_workers,
+        seed=args.seed, skip_norm_stats=True, framework="jax", raw_dataset=raw_train,
+        prefetch_factor=args.loader_prefetch_factor, episode_block_size=args.episode_block_size,
+    )
+    if len(data_loader.dataset) < effective_batch_size:
+        raise ValueError("Training split has fewer frames than batch_size")
+    logging.info(console.info(f"训练集大小: {len(data_loader.dataset)} 帧; dropout_rate={args.dropout_rate}"))
     if wandb_run is not None:
-        wandb_run.config.update({"dataset_size": len(data_loader.dataset), "effective_batch_size": effective_batch_size}, allow_val_change=True)
+        wandb_run.config.update({"dataset_size": len(data_loader.dataset),
+                                "effective_batch_size": effective_batch_size}, allow_val_change=True)
 
     val_loader = None
     val_num_batches = 0
-    if args.val_data_dir:
-        if args.val_interval <= 0:
-            logging.info(console.warn("已提供 val_data_dir，但 val_interval<=0，跳过验证"))
-        else:
-            val_data_config = build_value_data_config(
-                args.val_data_dir,
-                config,
-                tokenizer_path=resolved_tokenizer_path,
-                default_prompt=args.default_prompt,
-                filter_if_success=filter_if_success,
-            )
-            from openpi.training.agilex_hdf5_value_dataset import (
-                AgilexHdf5ValueDataset,
-                looks_like_agilex_hdf5_dir,
-            )
-
-            if looks_like_agilex_hdf5_dir(args.val_data_dir):
-                val_dataset = AgilexHdf5ValueDataset(
-                    args.val_data_dir,
-                    default_prompt=args.default_prompt,
-                    filter_if_success=filter_if_success,
-                )
-            else:
-                val_dataset = _data_loader.create_torch_dataset(
-                    val_data_config,
-                    config.action_horizon,
-                    config,
-                )
-            val_dataset_size = len(val_dataset)
-            if val_dataset_size < effective_batch_size:
-                raise ValueError(
-                    f"验证集太小: {val_dataset_size} 帧，小于 batch_size={effective_batch_size}"
-                )
-            val_num_batches = val_dataset_size // effective_batch_size
-            val_remainder = val_dataset_size % effective_batch_size
-            if val_num_batches == 0:
-                raise ValueError(
-                    f"验证集完整batch数为0: val_dataset_size={val_dataset_size}, batch_size={effective_batch_size}"
-                )
-            val_loader = _data_loader.create_value_data_loader(
-                val_data_config,
-                model_config=config,
-                batch_size=effective_batch_size,
-                sharding=data_sharding,
-                shuffle=False,
-                num_batches=val_num_batches,
-                num_workers=max_workers,
-                seed=args.seed,
-                skip_norm_stats=True,
-                framework="jax",
-            )
-            logging.info(
-                console.info(
-                    f"验证集大小: {val_dataset_size} 帧, 验证batch数: {val_num_batches}, "
-                    f"drop_last丢弃: {val_remainder} 帧, val_interval={args.val_interval}"
-                )
-            )
-            if wandb_run is not None:
-                wandb_run.config.update(
-                    {"val_dataset_size": val_dataset_size, "val_num_batches": val_num_batches},
-                    allow_val_change=True,
-                )
+    if raw_val is not None:
+        val_dataset_size = len(raw_val)
+        if val_dataset_size < effective_batch_size:
+            raise ValueError(f"验证集太小: {val_dataset_size} 帧，小于 batch_size={effective_batch_size}")
+        val_num_batches = val_dataset_size // effective_batch_size
+        val_remainder = val_dataset_size % effective_batch_size
+        val_loader = _data_loader.create_value_data_loader(
+            val_data_config, model_config=config, batch_size=effective_batch_size,
+            sharding=data_sharding, shuffle=False, num_batches=val_num_batches,
+            num_workers=max_workers, seed=args.seed, skip_norm_stats=True,
+            framework="jax", raw_dataset=raw_val, prefetch_factor=args.loader_prefetch_factor,
+        )
+        logging.info(console.info(
+            f"验证集大小: {val_dataset_size} 帧, 验证batch数: {val_num_batches}, "
+            f"drop_last丢弃: {val_remainder} 帧, val_interval={args.val_interval}"
+        ))
+        if wandb_run is not None:
+            wandb_run.config.update({"val_dataset_size": val_dataset_size,
+                                    "val_num_batches": val_num_batches}, allow_val_change=True)
 
     logging.info("\033[1;36m初始化模型...\033[0m")
     train_state, tx, lr_schedule = create_train_state(
@@ -790,7 +893,7 @@ def main():
             opt_state=opt_state,
             ema_params=ema_params
         )
-        new_state, info = train_step(state, tx, rng, observation, target, freeze_mode=args.freeze_mode)
+        new_state, info = train_step(state, tx, rng, observation, target, freeze_mode=args.freeze_mode, log_param_norms=False)
         return new_state.params, new_state.model_def, new_state.opt_state, new_state.ema_params, new_state.step, info
 
     @functools.partial(
@@ -824,44 +927,29 @@ def main():
     progress.sync_pbar_color(pbar)
     infos = []
 
-    # π0风格：数据预取和GPU利用率优化
-    data_iter = iter(data_loader)
-    
-    # 预取多个batch，减少GPU等待
-    logging.info("\033[1;36m预取前几个batch以优化GPU利用率...\033[0m")
-    prefetch_batches = []
-    for i in range(min(3, len(data_loader))):  # 预取3个batch
-        try:
-            batch = next(data_iter)
-            prefetch_batches.append(batch)
-        except StopIteration:
-            break
+    from openpi.training.prefetch import prefetch_iterator
+    data_iter = prefetch_iterator(data_loader, args.prefetch_batches)
+    logging.info(console.info(f"Continuous prefetch: {args.prefetch_batches} batches; worker prefetch factor: {args.loader_prefetch_factor}"))
+    try:
+        first_batch = next(data_iter)
+    except StopIteration:
+        raise ValueError("Training loader did not yield a complete batch") from None
 
-    if not prefetch_batches:
-        logging.error("\033[1;31m无法预取任何batch，检查数据集\033[0m")
-        return
-
-    logging.info(f"\033[1;32m成功预取 {len(prefetch_batches)} 个batch\033[0m")
-
-    # JIT预热：避免首次编译的GPU空闲
-    logging.info("\033[1;36mJIT编译预热...\033[0m")
-    observation, value = prefetch_batches[0]
+    logging.info(console.info("JIT compilation warmup..."))
+    observation, value = first_batch
     with sharding.set_mesh(mesh):
-        _ = jit_train_step(
-            train_state.params,
-            train_state.model_def,
-            train_state.opt_state,
-            train_state.ema_params,
-            train_state.step,
-            train_rng,
-            observation,
-            value,
+        warmup = jit_train_step(
+            train_state.params, train_state.model_def, train_state.opt_state,
+            train_state.ema_params, train_state.step, train_rng, observation, value,
         )
-    logging.info("\033[1;32mJIT编译完成，开始训练...\033[0m")
-    
-    # 重新初始化数据迭代器
-    data_iter = iter(data_loader)
-    prefetch_idx = 0
+    jax.block_until_ready(warmup)
+    del warmup
+    logging.info(console.ok("JIT warmup complete; training starts"))
+    pending_batch = first_batch
+    del first_batch
+    data_wait_seconds = 0.0
+    log_window_start = time.perf_counter()
+    jit_parameter_norms = jax.jit(lambda params: parameter_norms(params, args.freeze_mode))
 
     def run_validation(step: int) -> None:
         if val_loader is None:
@@ -869,7 +957,7 @@ def main():
 
         params_for_eval = train_state.ema_params if train_state.ema_params is not None else train_state.params
         val_losses: list[float] = []
-        val_iter = iter(val_loader)
+        val_iter = prefetch_iterator(val_loader, args.prefetch_batches)
 
         logging.info(console.info(f"开始验证: step={step}, batches={val_num_batches}"))
         for val_batch_idx in range(val_num_batches):
@@ -883,9 +971,13 @@ def main():
                     val_observation,
                     val_value,
                 )
-            val_losses.append(float(jax.device_get(val_loss)))
+            val_losses.append(val_loss)
+            if (val_batch_idx + 1) % 4 == 0:
+                jax.block_until_ready(val_loss)
 
-        mean_val_loss = float(np.mean(val_losses))
+        mean_val_loss = float(jax.device_get(jnp.mean(jnp.stack(val_losses))))
+        if hasattr(val_iter, "close"):
+            val_iter.close()
         pbar.write(f"Step {step}: val_cross_entropy={mean_val_loss:.4f}")
         if wandb_run is not None:
             wandb_run.log(
@@ -897,16 +989,13 @@ def main():
 
     for step in pbar:
         progress.sync_pbar_color(pbar)
-        # 使用预取的batch或获取新batch
-        if prefetch_idx < len(prefetch_batches):
-            observation, value = prefetch_batches[prefetch_idx]
-            prefetch_idx += 1
+        wait_start = time.perf_counter()
+        if pending_batch is not None:
+            observation, value = pending_batch
+            pending_batch = None
         else:
-            try:
-                observation, value = next(data_iter)
-            except StopIteration:
-                data_iter = iter(data_loader)
-                observation, value = next(data_iter)
+            observation, value = next(data_iter)
+        data_wait_seconds += time.perf_counter() - wait_start
         with sharding.set_mesh(mesh):
             new_params, new_model_def, new_opt_state, new_ema_params, new_step, info = jit_train_step(
                 train_state.params,
@@ -926,11 +1015,20 @@ def main():
                 ema_params=new_ema_params,
             )
 
+        # Bound asynchronous work to avoid accumulating device-resident batches.
+        if (step - start_step + 1) % 4 == 0:
+            jax.block_until_ready(info["loss"])
         infos.append(info)
 
         if step % args.log_interval == 0 and step > 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info.update(jax.device_get(jit_parameter_norms(train_state.params)))
+            elapsed = time.perf_counter() - log_window_start
+            reduced_info["data_wait_seconds"] = data_wait_seconds / len(infos)
+            reduced_info["frames_per_second"] = len(infos) * effective_batch_size / max(elapsed, 1e-6)
+            data_wait_seconds = 0.0
+            log_window_start = time.perf_counter()
             
             # 获取当前学习率
             current_lr = float(lr_schedule(step)) if lr_schedule is not None else None
@@ -953,9 +1051,11 @@ def main():
             # 计算当前损失
             current_loss = jax.device_get(info["loss"]).item()
             logging.info(f"\033[1;44m保存检查点 - Step {step}, Loss: {current_loss:.4f}\033[0m")
-            save_checkpoint(train_state, checkpoint_dir, step)
+            save_checkpoint(train_state, checkpoint_dir, step, camera_names=config.camera_names)
 
-    save_checkpoint(train_state, checkpoint_dir, args.num_train_steps)
+    if hasattr(data_iter, "close"):
+        data_iter.close()
+    save_checkpoint(train_state, checkpoint_dir, args.num_train_steps, camera_names=config.camera_names)
     if wandb_run is not None:
         wandb_run.finish()
     logging.info("\033[1;32m训练完成!\033[0m")

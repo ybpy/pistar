@@ -1,0 +1,10 @@
+{
+  "batch_size": 64,
+  "workers": 4,
+  "block_size": 0,
+  "measured_batches": 16,
+  "warmup_seconds": 73.77193143218756,
+  "mean_batch_seconds": 2.2834996579913422,
+  "p95_batch_seconds": 11.182755144778639,
+  "frames_per_second": 28.027155500560472
+}

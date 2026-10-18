@@ -30,6 +30,9 @@ class ValueModelConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     gemma_variant: Literal["gemma3_270m"] = "gemma3_270m"
     siglip_variant: str = "So400m/14"
+    dropout_rate: float = 0.1
+    # Legacy two-view default; no camera-specific learned parameters.
+    camera_names: tuple[str, ...] = ("head", "left")
     
     # Value function 特定配置
     action_dim: int = 32
@@ -42,6 +45,10 @@ class ValueModelConfig(_model.BaseModelConfig):
 
     def __post_init__(self):
         """在初始化后设置 Gemma 相关配置"""
+        if not 0.0 <= self.dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be in [0, 1)")
+        from openpi.shared.value_cameras import normalize_camera_names
+        object.__setattr__(self, "camera_names", normalize_camera_names(self.camera_names))
         # 使用 Gemma3_270M 的完整配置（借鉴 Pi0 方式但使用 Gemma3）
         gemma_config = Gemma3_270M().config
         
@@ -66,19 +73,14 @@ class ValueModelConfig(_model.BaseModelConfig):
 
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, jax.Array]:
         """为 Value Model 创建输入规格"""
+        from openpi.shared.value_cameras import CAMERA_MODEL_KEYS
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "wrist_0_rgb": image_mask_spec,
-                },
+                images={CAMERA_MODEL_KEYS[name]: image_spec for name in self.camera_names},
+                image_masks={CAMERA_MODEL_KEYS[name]: image_mask_spec for name in self.camera_names},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

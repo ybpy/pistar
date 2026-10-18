@@ -1,0 +1,65 @@
+{
+  "scanned_episodes": 7294,
+  "issues": [
+    {
+      "path": "/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product/sort_hybrid_tag_v1/20260922/episode_259/episode.hdf5",
+      "issues": [
+        {
+          "source": "hdf5",
+          "value": "ITEM-01y005",
+          "error": "missing basket color mapping for 01y005"
+        }
+      ]
+    },
+    {
+      "path": "/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product/sort_hybrid_tag_v1/20260923/episode_494/episode.hdf5",
+      "issues": [
+        {
+          "source": "hdf5",
+          "value": "ITEM- 25;;=",
+          "error": "missing basket color mapping for  25;;="
+        }
+      ]
+    },
+    {
+      "path": "/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product/sort_hybrid_tag_v1/20260923/episode_626/episode.hdf5",
+      "issues": [
+        {
+          "source": "hdf5",
+          "value": "ITEM-01y005",
+          "error": "missing basket color mapping for 01y005"
+        }
+      ]
+    },
+    {
+      "path": "/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product/sort_hybrid_tag_v1/20260923/episode_822/episode.hdf5",
+      "issues": [
+        {
+          "source": "hdf5",
+          "value": "ITEMt02-003",
+          "error": "missing basket color mapping for 003"
+        }
+      ]
+    },
+    {
+      "path": "/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product/sort_hybrid_tag_v1/20260926/episode_1917/episode.hdf5",
+      "issues": [
+        {
+          "source": "hdf5",
+          "value": "ITEM-01u; 2",
+          "error": "missing basket color mapping for 01u; 2"
+        }
+      ]
+    },
+    {
+      "path": "/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product/sort_hybrid_tag_v2/20261008/episode_2769/episode.hdf5",
+      "issues": [
+        {
+          "source": "hdf5",
+          "value": "ITEM-01%003",
+          "error": "missing basket color mapping for 01%003"
+        }
+      ]
+    }
+  ]
+}

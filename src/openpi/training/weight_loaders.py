@@ -17,6 +17,10 @@ from openpi.shared import console
 
 logger = logging.getLogger(__name__)
 
+_GEMMA_PATH = os.path.join(os.path.dirname(__file__), "../../../gemma")
+if _GEMMA_PATH not in sys.path:
+    sys.path.insert(0, _GEMMA_PATH)
+
 _BV_PATH = os.path.join(os.path.dirname(__file__), "../../../big_vision")
 if _BV_PATH not in sys.path:
     sys.path.insert(0, _BV_PATH)
@@ -165,9 +169,19 @@ def _maybe_convert_gemma_ckpt_tree(tree: at.Params) -> at.Params:
     try:
         ckpt_tree = gm_ckpt._CheckpointTree(tree=tree)
         return ckpt_tree.nested_tree
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(console.warn(f"Gemma checkpoint convert failed: {exc}"))
-        return tree
+    except AttributeError as exc:
+        # Older etils lacks etree.copy. Preserve tensor leaves while converting
+        # the legacy transformer/path layout with Gemma's own remapping rules.
+        if "copy" not in str(exc) or not isinstance(tree, Mapping) or not tree:
+            raise
+        if not all(k.startswith("transformer/") for k in tree):
+            raise
+        flat_tree = dict(tree)
+        if gm_ckpt._is_stacked_layout(flat_tree):
+            flat_tree = gm_ckpt._compat.unstack_params(flat_tree)
+        nested = gm_ckpt._compat.nest_params(gm_ckpt._compat.param_remapper(flat_tree))
+        logger.info(console.info("Gemma checkpoint converted using legacy etils compatibility"))
+        return nested["transformer"]
 
 
 def _select_siglip_image_params(siglip_params: at.Params, ref_params: at.Params) -> at.Params:
@@ -312,7 +326,7 @@ class ValueModelWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         logger.info(console.info("加载 SigLIP 权重 (from local checkpoint)..."))
         #siglip_path = "/data/train_dataset/checkpoint/siglip2-so400m-patch14-384-jax/siglip2_so400m14_224.npz"
-        siglip_path = "/public/home/wangsenbao_it/litianheng/checkpoint/siglip2-so400m-patch14-224-jax/siglip2_so400m14_224.npz"
+        siglip_path = "/ML-vePFS/infra_rd/kerlocy/checkpoints/vlm_ckpt/vlm_ckpt/siglip2-so400m-patch14-224-jax/siglip2_so400m14_224.npz"
         siglip_params = None
         if bv_utils is not None:
             try:
@@ -336,7 +350,7 @@ class ValueModelWeightLoader(WeightLoader):
             _summarize_param_match("SigLIP", siglip_params, params["img"])
 
         logger.info(console.info("加载 Gemma 3 270M 权重 (from local Orbax checkpoint)..."))
-        gemma_checkpoint_dir = "/public/home/wangsenbao_it/litianheng/checkpoint/gemma-3-270m"
+        gemma_checkpoint_dir = "/ML-vePFS/infra_rd/kerlocy/checkpoints/vlm_ckpt/vlm_ckpt/gemma-3-270m"
         #gemma_checkpoint_dir = "/data/train_dataset/checkpoint/gemma-3-270m"
 
         # 使用 Gemma 官方 ckpts loader（优先），必要时回退 Orbax
@@ -371,6 +385,21 @@ class ValueModelWeightLoader(WeightLoader):
             raise
         if isinstance(params, Mapping) and "llm" in params:
             _summarize_param_match("Gemma", gemma_params, params["llm"])
+
+        # Frozen backbones must be fully pretrained; partial loading otherwise
+        # silently leaves random initialization in place.
+        for name, loaded in (("img", siglip_params), ("llm", gemma_params)):
+            reference = flax.traverse_util.flatten_dict(params[name], sep="/")
+            flat_loaded = flax.traverse_util.flatten_dict(loaded, sep="/")
+            invalid = [
+                k for k, value in reference.items()
+                if k not in flat_loaded or flat_loaded[k].shape != value.shape
+            ]
+            if invalid:
+                raise ValueError(
+                    f"{name} pretrained checkpoint has {len(invalid)} missing or incompatible "
+                    f"parameters (sample: {sorted(invalid)[:10]})"
+                )
 
         loaded_params = {
             "img": siglip_params,

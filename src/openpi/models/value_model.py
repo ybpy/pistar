@@ -108,15 +108,20 @@ class ValueHead(nnx.Module):
         self.layer_norm = nnx.LayerNorm(input_dim, rngs=rngs)
         self.linear1 = nnx.Linear(input_dim, hidden_dim, rngs=rngs)
         self.linear2 = nnx.Linear(hidden_dim, output_dim, rngs=rngs)
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be in [0, 1)")
         self.dropout_rate = dropout_rate
 
-    def __call__(self, x: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, train: bool = False, rng: jax.Array | None = None) -> jnp.ndarray:
         x = self.layer_norm(x)
         x = self.linear1(x)
         x = nnx.gelu(x)
-        # 简化：训练时不使用 dropout，避免状态管理复杂性
-        # if train and self.dropout_rate > 0:
-        #     x = nnx.dropout(x, rate=self.dropout_rate, deterministic=False)
+        if train and self.dropout_rate > 0:
+            if rng is None:
+                raise ValueError("Training with dropout requires an explicit RNG key")
+            keep_prob = 1.0 - self.dropout_rate
+            keep = jax.random.bernoulli(rng, keep_prob, x.shape)
+            x = jnp.where(keep, x / keep_prob, 0)
         return self.linear2(x)
 
 
@@ -217,7 +222,7 @@ class ValueModel(nnx.Module):
             input_dim=gemma_config.embed_dim,
             hidden_dim=hidden_dim,
             output_dim=NUM_ATOMS,
-            dropout_rate=0.1,
+            dropout_rate=config.dropout_rate,
             rngs=rngs,
         )
 
@@ -233,8 +238,14 @@ class ValueModel(nnx.Module):
         image_tokens_list = []
         image_mask_list = []
 
+        if len(obs.images) > 3:
+            raise ValueError("ValueModel supports at most three camera streams")
         # 处理图像特征
-        for name in obs.images:
+        # Explicit ordering is stable even when JAX reconstructs dictionaries alphabetically.
+        canonical = ("base_0_rgb", "wrist_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+        names = [name for name in canonical if name in obs.images]
+        names.extend(name for name in obs.images if name not in canonical)
+        for name in names:
             image_tokens, _ = self.img(obs.images[name], train=False)
             image_tokens = self.img_projection(image_tokens)
             image_tokens_list.append(image_tokens)
@@ -285,8 +296,7 @@ class ValueModel(nnx.Module):
                                        obs.tokenized_prompt, 
                                        method=embedder.encode)
             
-            # 【关键修改】冻结 Embedder，防止梯度回传破坏预训练语义
-            text_tokens = jax.lax.stop_gradient(text_tokens)
+            # Backbone freezing is controlled by the training parameter filter.
             
             # 应用交叉注意力：让文本特征关注图像特征
             text_tokens_normed = self.cross_attn_norm(text_tokens)
@@ -294,7 +304,10 @@ class ValueModel(nnx.Module):
                 text_tokens_normed,   # Query: 文本特征
                 all_image_tokens,     # Key: 图像特征
                 all_image_tokens,     # Value: 图像特征
+                mask=all_image_masks[:, None, None, :],
             )
+            # An entirely missing visual row must not inject attention output/bias.
+            attended_text = jnp.where(jnp.any(all_image_masks, axis=1)[:, None, None], attended_text, 0)
             # 残差连接
             text_tokens = text_tokens + attended_text
             
@@ -309,7 +322,6 @@ class ValueModel(nnx.Module):
             text_tokens = embedder.apply({"params": embedder_params}, 
                                        obs.tokenized_prompt, 
                                        method=embedder.encode)
-            text_tokens = jax.lax.stop_gradient(text_tokens) # 冻结
             tokens = text_tokens
             input_mask = obs.tokenized_prompt_mask
             ar_mask = jnp.array([False] * text_tokens.shape[1])
@@ -329,7 +341,8 @@ class ValueModel(nnx.Module):
 
         return tokens, input_mask, ar_mask
 
-    def __call__(self, observation: _model.Observation, *, train: bool = False) -> at.Float[at.Array, "b num_atoms"]:
+    def __call__(self, observation: _model.Observation, *, train: bool = False,
+                 rng: jax.Array | None = None) -> at.Float[at.Array, "b num_atoms"]:
         """Forward pass to compute value distribution logits.
 
         Args:
@@ -348,7 +361,7 @@ class ValueModel(nnx.Module):
         denom = jnp.maximum(jnp.sum(input_mask, axis=1, keepdims=True), 1)
         pooled = jnp.sum(masked_tokens, axis=1) / denom.astype(tokens.dtype)
 
-        return self.value_head(pooled, train=train)
+        return self.value_head(pooled, train=train, rng=rng)
 
     def compute_value(
         self,
@@ -369,8 +382,9 @@ class ValueModel(nnx.Module):
         """
         # Value model 使用数据中实际可用的图像键
         available_keys = list(observation.images.keys())
-        observation = _model.preprocess_observation(rng, observation, train=train, image_keys=available_keys)
-        logits = self(observation, train=train)
+        preprocess_rng, dropout_rng = jax.random.split(rng)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=available_keys)
+        logits = self(observation, train=train, rng=dropout_rng)
         return dist_to_value(logits)
 
     def compute_loss(
@@ -394,8 +408,9 @@ class ValueModel(nnx.Module):
         """
         # Value model 使用数据中实际可用的图像键
         available_keys = list(observation.images.keys())
-        observation = _model.preprocess_observation(rng, observation, train=train, image_keys=available_keys)
-        logits = self(observation, train=train).astype(jnp.float32)
+        preprocess_rng, dropout_rng = jax.random.split(rng)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=available_keys)
+        logits = self(observation, train=train, rng=dropout_rng).astype(jnp.float32)
         target = normalize_value_target_shape(target)
         target_dist = target_to_twohot(target) if target.ndim == 1 else target
         target_dist = target_dist.astype(jnp.float32)

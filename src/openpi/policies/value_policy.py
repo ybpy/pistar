@@ -89,76 +89,52 @@ def _normalize_scalar_label(value, *, name: str) -> np.float32:
 
 @dataclasses.dataclass(frozen=True)
 class ValueInputs(transforms.DataTransformFn):
-    """将 LeRobot 数据转换为 Value Model 期望的输入格式。"""
+    """Map 1-3 independent camera streams to the value model's fixed per-batch schema."""
+
+    camera_names: tuple[str, ...] = ("head", "left")
 
     def __call__(self, data: dict) -> dict:
-        base_candidates = [
-            "observation/image",
-            "observation.image",
-            "image",
-            "observation/images/cam_high",
-            "observation.images.cam_high",
-            "images/cam_high",
-            "images.cam_high",
-            "observation/images/base_0_rgb",
-            "observation.images.base_0_rgb",
-            "images/base_0_rgb",
-            "images.base_0_rgb",
-        ]
-        wrist_candidates = [
-            "observation/wrist_image",
-            "observation.wrist_image",
-            "wrist_image",
-            "observation/images/cam_left_wrist",
-            "observation.images.cam_left_wrist",
-            "observation/images/cam_right_wrist",
-            "observation.images.cam_right_wrist",
-            "images/cam_left_wrist",
-            "images.cam_left_wrist",
-            "images/cam_right_wrist",
-            "images.cam_right_wrist",
-            "observation/wrist_image_left",
-            "observation.wrist_image_left",
-            "observation/wrist_image_right",
-            "observation.wrist_image_right",
-        ]
-
-        base_raw = _get_first(
-            data,
-            base_candidates,
-            required=False,
-            name="base_image",
-        )
-        wrist_raw = _get_first(
-            data,
-            wrist_candidates,
-            required=False,
-            name="wrist_image",
-        )
-        has_base = base_raw is not None
-        if has_base and isinstance(base_raw, float) and np.isnan(base_raw):
-            has_base = False
-        has_wrist = wrist_raw is not None
-        if has_wrist and isinstance(wrist_raw, float) and np.isnan(wrist_raw):
-            has_wrist = False
-
-        if not has_base and not has_wrist:
-            raise KeyError(
-                f"Missing base_image. Tried keys: {base_candidates}. "
-                f"Fallback wrist_image keys: {wrist_candidates}. "
-                f"Available top-level keys: {list(data.keys())}"
-            )
-
-        # 单相机数据集：没有 base_image 时，退化为把 wrist_image 当作唯一视觉输入。
-        base_source = wrist_raw if not has_base else base_raw
-        base_image = _parse_image(base_source)
-
-        if has_wrist and has_base:
-            wrist_image = _parse_image(wrist_raw)
-            use_wrist = True
-        else:
-            wrist_image = np.zeros_like(base_image)
-            use_wrist = False
+        from openpi.shared.value_cameras import CAMERA_MODEL_KEYS, image_is_present, normalize_camera_names
+        camera_names = normalize_camera_names(self.camera_names)
+        aliases = {
+            "head": ("image", "cam_high", "base_0_rgb"),
+            "left": ("wrist_image", "wrist_image_left", "cam_left_wrist", "wrist_0_rgb", "left_wrist_0_rgb"),
+            "right": ("right_wrist_image", "wrist_image_right", "cam_right_wrist", "right_wrist_0_rgb"),
+        }
+        raw = {}
+        for name in camera_names:
+            candidates = []
+            for alias in aliases[name]:
+                candidates.extend((alias, f"observation/{alias}", f"observation.{alias}",
+                                   f"observation/images/{alias}", f"observation.images.{alias}",
+                                   f"images/{alias}", f"images.{alias}", f"image/{alias}", f"image.{alias}"))
+            for candidate in candidates:
+                value, found = _get_by_path(data, candidate)
+                if found and image_is_present(value):
+                    raw[name] = value
+                    break
+        # Retain the former right-as-wrist fallback only for the legacy two-view layout.
+        if camera_names == ("head", "left") and "left" not in raw:
+            for alias in aliases["right"]:
+                for candidate in (alias, f"observation/{alias}", f"observation.{alias}",
+                                  f"observation/images/{alias}", f"observation.images.{alias}",
+                                  f"images/{alias}", f"images.{alias}"):
+                    value, found = _get_by_path(data, candidate)
+                    if found and image_is_present(value):
+                        raw["left"] = value
+                        break
+                if "left" in raw:
+                    break
+        if not raw:
+            raise KeyError(f"No images for selected value cameras {camera_names}; keys={list(data)}")
+        # Preserve the legacy wrist-only fallback when head was requested.
+        if "head" in camera_names and "head" not in raw:
+            first = next(iter(raw))
+            raw["head"] = raw.pop(first)
+        parsed = {name: _parse_image(value) for name, value in raw.items()}
+        template = next(iter(parsed.values()))
+        images = {CAMERA_MODEL_KEYS[name]: parsed[name] if name in parsed else np.zeros_like(template) for name in camera_names}
+        masks = {CAMERA_MODEL_KEYS[name]: np.bool_(name in parsed) for name in camera_names}
 
         state = _get_first(
             data,
@@ -198,14 +174,8 @@ class ValueInputs(transforms.DataTransformFn):
 
         inputs = {
             "state": state,
-            "image": {
-                "base_0_rgb": base_image,
-                "wrist_0_rgb": wrist_image,
-            },
-            "image_mask": {
-                "base_0_rgb": np.True_,
-                "wrist_0_rgb": np.True_ if use_wrist else np.False_,
-            },
+            "image": images,
+            "image_mask": masks,
         }
 
         if "actions" in data:

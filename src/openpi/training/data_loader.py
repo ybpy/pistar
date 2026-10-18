@@ -85,6 +85,11 @@ class TransformedDataset(Dataset[T_co]):
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
 
+    def __getitems__(self, indices):
+        fetch = getattr(self._dataset, "__getitems__", None)
+        samples = fetch(indices) if callable(fetch) else [self._dataset[index] for index in indices]
+        return [self._transform(sample) for sample in samples]
+
     def __len__(self) -> int:
         return len(self._dataset)
 
@@ -160,6 +165,8 @@ def create_torch_dataset(
     """Create a dataset for training."""
     if data_config.local_data_dir is not None:
         local_dir = data_config.local_data_dir
+        if isinstance(local_dir, (list, tuple)):
+            raise ValueError("Multiple local_data_dir entries are only supported for AgileX HDF5 value training")
         if not os.path.exists(local_dir):
             raise ValueError(f"Local data directory does not exist: {local_dir}")
         repo_id = local_dir
@@ -415,6 +422,31 @@ def create_rlds_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+class EpisodeBlockSampler(torch.utils.data.Sampler):
+    """Shuffle short episode blocks; every frame still appears once per epoch."""
+
+    def __init__(self, episode_offsets, block_size: int = 16, seed: int = 42):
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        self.total_frames = int(episode_offsets[-1])
+        self.seed = seed
+        self.epoch = 0
+        self.blocks = [(start, min(block_size, end - start))
+                       for begin, end in zip(episode_offsets[:-1], episode_offsets[1:], strict=True)
+                       for start in range(begin, end, block_size)]
+
+    def __len__(self):
+        return self.total_frames
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        for block_index in rng.permutation(len(self.blocks)):
+            start, length = self.blocks[int(block_index)]
+            for offset in rng.permutation(length):
+                yield start + int(offset)
+
+
 class TorchDataLoader:
     """Torch data loader implementation."""
 
@@ -430,6 +462,7 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        prefetch_factor: int = 4,
     ):
         """Create a PyTorch data loader.
 
@@ -468,6 +501,8 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
+        if prefetch_factor <= 0:
+            raise ValueError("prefetch_factor must be positive")
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
@@ -476,6 +511,7 @@ class TorchDataLoader:
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,
@@ -523,6 +559,10 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    torch.set_num_threads(1)
+    import cv2
+    cv2.setNumThreads(1)
 
 
 class RLDSDataLoader:
@@ -619,19 +659,25 @@ def create_value_data_loader(
     seed: int = 0,
     skip_norm_stats: bool = True,
     framework: Literal["jax", "pytorch"] = "jax",
+    raw_dataset: Dataset | None = None,
+    prefetch_factor: int = 4,
+    episode_block_size: int = 16,
 ) -> DataLoader[tuple[_model.Observation, jnp.ndarray]]:
     from openpi.training.agilex_hdf5_value_dataset import (
         AgilexHdf5ValueDataset,
-        looks_like_agilex_hdf5_dir,
+        looks_like_agilex_hdf5_dirs,
     )
 
     data_root = data_config.local_data_dir or data_config.repo_id
-    if data_root and looks_like_agilex_hdf5_dir(data_root):
+    if raw_dataset is not None:
+        dataset = raw_dataset
+    elif data_root and looks_like_agilex_hdf5_dirs(data_root):
         logging.info(f"Detected AgileX HDF5 value dataset: {data_root}")
         dataset = AgilexHdf5ValueDataset(
-            data_root,
+            list(data_root) if isinstance(data_root, tuple) else data_root,
             default_prompt=data_config.agilex_default_prompt,
             filter_if_success=data_config.agilex_filter_if_success,
+            camera_names=getattr(model_config, "camera_names", ("head", "left")),
         )
     else:
         dataset = create_torch_dataset(data_config, model_config.action_horizon, model_config)
@@ -653,6 +699,14 @@ def create_value_data_loader(
     else:
         local_batch_size = batch_size // jax.process_count()
 
+    if shuffle and sampler is None and episode_block_size > 0:
+        raw = dataset
+        while hasattr(raw, "_dataset"):
+            raw = raw._dataset
+        if hasattr(raw, "episode_offsets"):
+            sampler = EpisodeBlockSampler(raw.episode_offsets, episode_block_size, seed)
+            logging.info("Episode-local shuffle block size: %s", episode_block_size)
+
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
         dataset,
@@ -664,6 +718,7 @@ def create_value_data_loader(
         num_workers=num_workers,
         seed=seed,
         framework=framework,
+        prefetch_factor=prefetch_factor,
     )
 
     return ValueDataLoaderImpl(data_config, data_loader, dataset)
