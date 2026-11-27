@@ -1,4 +1,6 @@
-"""重写数据集的 reward_label。
+"""按旧版规则重写历史数据的 reward_label。
+
+新版标签请用 add_value_labels.py 或 add_hdf5_value_labels.py 同时生成价值和奖励。
 
 规则：
 0. 若缺少 reward_label，则创建
@@ -27,6 +29,7 @@ from tqdm import tqdm
 
 from openpi.shared import console
 from openpi.shared import progress
+from openpi.training.recap_labels import METHOD as RECAP_LABEL_METHOD
 
 
 REWARD_COLUMN = "reward_label"
@@ -116,6 +119,8 @@ def rewrite_rewards_in_hdf5(hdf5_path: str) -> dict:
     path = Path(hdf5_path)
     try:
         with h5py.File(path, "a") as handle:
+            if handle.attrs.get("value_label_method") == RECAP_LABEL_METHOD:
+                raise ValueError("Use add_hdf5_value_labels.py to regenerate paired RECAP rewards")
             if VALUE_LABEL_COLUMN not in handle:
                 raise ValueError(f"缺少 {VALUE_LABEL_COLUMN}")
             value_labels = np.asarray(handle[VALUE_LABEL_COLUMN], dtype=np.float32)
@@ -220,6 +225,8 @@ def main() -> None:
         data_dir = Path(raw_dir)
         if not data_dir.exists():
             raise ValueError(f"数据目录不存在: {data_dir}")
+        if (data_dir / "meta" / "recap_value_labels.json").is_file():
+            raise ValueError("Use add_value_labels.py to regenerate paired RECAP rewards")
         if _looks_like_hdf5_dir(data_dir):
             rewrite_hdf5_dir(data_dir, args.num_workers)
             continue

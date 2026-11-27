@@ -71,8 +71,7 @@ python examples/libero/pistar_rlds_demo_processing.py \
 
 - 每一帧 `intervention = 1`。
 - 每一帧 `adv_ind = positive`。
-- `value_label` 按成功轨迹规则生成，范围在 `[-1, 0]`。
-- `reward_label` 在非终止帧为 `-1 / T`，最后一帧为 `0`。
+- 转换器提供初始标签。合并后在整个数据集上重算 `value_label` 和 `reward_label`。
 
 如果设置了 `--output_dir`，输出路径是 `/path/to/lerobot_datasets/libero_demo_pistar`。如果不设置，LeRobot 会写到 `HF_LEROBOT_HOME` 下。
 
@@ -205,6 +204,14 @@ python scripts/merge_datasets.py \
 ## VLM 训练与 Advantage 打标
 
 VLM value model 输入图像观测和任务文本，输出当前帧的价值估计。训练时使用 `value_label` 作为监督；推理时对 rollout 帧计算 value，再结合 `reward_label` 计算 N-step advantage，最后写回 `adv_ind`。
+
+合并后、训练前重算两列：
+
+```bash
+python scripts/add_value_labels.py --data_dir /path/to/lerobot_datasets/libero_mixed_round1
+```
+
+`Tmax` 是所有输入轨迹的最大帧数，在划分训练集和验证集之前统一统计。`T` 是本条轨迹的末帧下标，`t` 从 0 开始。默认 `C=0.3*Tmax`，成功标签为 `clip(-(T-t)/Tmax, -1, 0)`，失败标签为 `clip((-(T-t)-C)/Tmax, -1, 0)`。配套奖励为普通帧 `-1/Tmax`、成功末帧 `0`、失败末帧 `-0.3`。两列原地更新，`--dry-run` 可先检查且不写入。改过标签后请重新训练 VLM。
 
 ### 1. 训练 VLM value model
 

@@ -74,8 +74,7 @@ For demo data, the conversion script treats each trajectory as a successful expe
 
 - Every frame has `intervention = 1`.
 - Every frame has `adv_ind = positive`.
-- `value_label` is generated according to the successful-trajectory rule, with values in `[-1, 0]`.
-- `reward_label` is `-1 / T` for non-terminal frames and `0` for the last frame.
+- The converter's initial `value_label` and `reward_label` are replaced after merging by the labeling step below.
 
 If `--output_dir` is set, the output path is `/path/to/lerobot_datasets/libero_demo_pistar`. If it is not set, LeRobot writes the dataset under `HF_LEROBOT_HOME`.
 
@@ -202,7 +201,7 @@ There is one point that can easily be confusing here:
 - `--args.adv_ind_input positive` is the condition fed into the PiStar policy during inference.
 - The saved rollout frames are initially written with `adv_ind = none`. This is only a placeholder and needs to be overwritten as `positive` or `negative` later by `scripts/label_advantage_from_vlm.py`.
 
-The simulation rollout output fields are consistent with the demo data. However, because LIBERO rollout has no human intervention, `intervention = 0`. Successful episodes generate `value_label` / `reward` / `reward_label` according to the successful rule, while failed episodes generate these fields according to the failure rule.
+LIBERO rollouts have `intervention = 0`. The sparse `reward` records success (1 on a successful last frame, 0 otherwise). Recompute the value and reward labels on the full mixed dataset after merging.
 
 ### 7. Merge demo and rollout data
 
@@ -222,6 +221,19 @@ The merged dataset will be used for VLM value training, VLM advantage labeling, 
 ## VLM Training and Advantage Labeling
 
 The VLM value model takes image observations and task text as input and outputs a value estimate for the current frame. During training, it uses `value_label` as supervision. During inference, it computes value for rollout frames, then combines it with `reward_label` to compute N-step advantage, and finally writes the result back to `adv_ind`.
+
+Before training, replace both labels on the merged dataset:
+
+```bash
+python scripts/add_value_labels.py --data_dir /path/to/lerobot_datasets/libero_mixed_round1
+```
+
+`Tmax` is the longest episode in frames across all supplied data, before the train/validation split. With zero-based frame `t` and episode last frame `T`, the value is `clip(-(T-t)/Tmax - 0.3 * failed, -1, 0)`.
+
+- For successful episodes, `reward_label` is `-1 / Tmax` for non-terminal frames and `0` for the last frame.
+- For failed episodes, non-terminal rewards are also `-1 / Tmax`, and the last frame defaults to `-0.3`.
+
+Clipping applies only to the value targets. Pass `--failure-cost-ratio` to change 0.3, or `--dry-run` to inspect the scale before replacing labels. Train a new VLM checkpoint after changing the rewards or labels.
 
 ### 1. Train the VLM value model
 

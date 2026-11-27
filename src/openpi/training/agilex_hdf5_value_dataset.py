@@ -4,9 +4,8 @@ Reads converted episode folders the same way manifold_demo does:
   <dataset_dir>/<date>/episode_xxx/episode.hdf5
   observation/camera/{head,left,right}  — JPEG base64 frames
 
-Value labels:
-  success / take_over : value_label = -(T - t - 1) / (T - 1)   (start -1, end 0)
-  fail                : value_label = -1.0 for every frame
+Value labels are read from disk. Generate new labels for the entire corpus
+before training with scripts/add_hdf5_value_labels.py.
 
 Prompt matches pi0.5 barcode placement:
   frame <= barcode index: first line (pick and scan)
@@ -271,17 +270,6 @@ def read_stored_value_labels(
         return length, labels, status, read_barcodes(f)
 
 
-def compute_success_value_labels(episode_length_n: int) -> np.ndarray:
-    if episode_length_n <= 1:
-        return np.zeros((episode_length_n,), dtype=np.float32)
-    t = np.arange(episode_length_n)
-    return (-(episode_length_n - t - 1) / (episode_length_n - 1)).astype(np.float32)
-
-
-def compute_fail_value_labels(episode_length_n: int) -> np.ndarray:
-    return np.full((episode_length_n,), -1.0, dtype=np.float32)
-
-
 def decode_hdf5_camera_frame(hdf5_file: h5py.File, camera_name: str, frame_idx: int) -> np.ndarray:
     """Decode one JPEG-base64 camera frame. Same path as manifold_demo AgileXDataset."""
     camera_path = f"observation/camera/{camera_name}"
@@ -346,14 +334,9 @@ class AgilexHdf5ValueDataset(TorchDataset):
                 logger.warning("Excluding episode with invalid prompt metadata: %s: %s", hdf5_path, exc)
                 skipped += 1
                 continue
-            if stored_labels is not None:
-                labels = stored_labels
-            else:
-                labels = (
-                    compute_fail_value_labels(length)
-                    if status in FAIL_STATUSES
-                    else compute_success_value_labels(length)
-                )
+            if stored_labels is None:
+                raise ValueError(f"{hdf5_path}: missing or misaligned value_label; "
+                                 "run scripts/add_hdf5_value_labels.py on the full corpus first")
             self.episodes.append(
                 {
                     "folder": folder,
@@ -362,7 +345,7 @@ class AgilexHdf5ValueDataset(TorchDataset):
                     "if_success": status,
                     "barcodes": barcodes,
                     "segments": segments,
-                    "value_labels": labels,
+                    "value_labels": stored_labels,
                 }
             )
 

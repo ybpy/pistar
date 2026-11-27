@@ -35,6 +35,7 @@ from openpi.training.agilex_hdf5_value_dataset import (
     read_barcodes,
     scan_episode_folders,
 )
+from openpi.training.recap_labels import METHOD as RECAP_LABEL_METHOD
 
 LOG = logging.getLogger("openpi")
 EARLY_DATASETS = frozenset({
@@ -141,6 +142,7 @@ def _load_episode(folder: Path, lookahead: int) -> dict | None:
         if "reward_label" not in handle:
             raise ValueError(f"缺少 reward_label: {path}")
         reward = np.asarray(handle["reward_label"], dtype=np.float32)
+        uses_full_frame_rewards = handle.attrs.get("value_label_method") == RECAP_LABEL_METHOD
         if "intervention" in handle:
             intervention = np.asarray(handle["intervention"], dtype=np.int64).reshape(-1)
         else:
@@ -150,7 +152,12 @@ def _load_episode(folder: Path, lookahead: int) -> dict | None:
         raise ValueError(f"标签长度和 episode 不一致: {path}")
     stride = frame_keep_mode(folder)
     kept = kept_frame_indices(length, stride)
-    reward_kept = reward[kept]
+    if uses_full_frame_rewards:
+        # Each sampled step spans the original frames up to the next sample.
+        # The last range includes the terminal reward even if that frame is dropped.
+        reward_kept = np.add.reduceat(reward, kept, dtype=np.float64).astype(np.float32)
+    else:
+        reward_kept = reward[kept]
     if not np.isfinite(reward_kept).all():
         raise ValueError(f"抽帧后的 reward_label 含 NaN: {path}")
     intervention_kept = (intervention[kept] != 0).astype(np.int64)

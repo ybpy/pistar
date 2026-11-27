@@ -1,149 +1,128 @@
-"""Write value_label into converted AgileX episode.hdf5 files.
+"""Replace episode value_label and reward_label using a shared corpus Tmax."""
 
-success / take_over: value_label = -(T - t - 1) / (T - 1)
-  frame 0 is -1, the last frame is 0. A one-frame episode is 0.
-fail: value_label = -1 for every frame
-
-Datasets in SUCCESS_DATASETS are treated as success even when meta.json has no if_success.
-"""
-
-from __future__ import annotations
-
+import argparse
+from dataclasses import dataclass
 import json
-from multiprocessing import Pool
 from pathlib import Path
-import sys
-import traceback
 
 import h5py
-import numpy as np
 
-ROOT = Path("/ML-vePFS/shared/world_action_model_data/self_produced/agilex_project/sort_product")
-SUCCESS_DATASETS = (
-    "260728_v1",
-    "260729_v1",
-    "260730_v1",
-    "260804_v1",
-    "260805_v1",
-    "260807_v1",
-    "260810_v1",
+from openpi.training.recap_labels import DEFAULT_FAILURE_COST_RATIO
+from openpi.training.recap_labels import REWARD_LABEL
+from openpi.training.recap_labels import VALUE_LABEL
+from openpi.training.recap_labels import RecapLabelScale
+from openpi.training.recap_labels import parse_success
+
+
+SEGMENT_DATASETS = frozenset((
+    "260728_v1", "260729_v1", "260730_v1", "260804_v1", "260805_v1", "260807_v1", "260810_v1",
+))
+FRAME_KEYS = (
+    "action", "observations/qpos/left_arm", "observations/qpos",
+    "observations/camera/cam_head", "observation/camera/head", "source_index",
 )
-STATUS_DATASETS = (
-    "sort_product_339_904",
-    "sort_product_339_905",
-    "sort_product_217",
-    "sort_hybrid_tag",
-    "sort_hybrid_tag_v1",
-    "sort_hybrid_tag_v2",
-    "sort_hybrid_tag_v3",
-)
-FAIL_STATUS = "fail"
 
 
-def iter_episode_hdf5(dataset_dir: Path) -> list[Path]:
-    files: list[Path] = []
-    if not dataset_dir.is_dir():
-        return files
-    for child in sorted(path for path in dataset_dir.iterdir() if path.is_dir()):
-        direct = child / "episode.hdf5"
-        if direct.is_file():
-            files.append(direct)
-            continue
-        for episode in sorted(path for path in child.iterdir() if path.is_dir()):
-            hdf5_path = episode / "episode.hdf5"
-            if hdf5_path.is_file():
-                files.append(hdf5_path)
+@dataclass(frozen=True)
+class Episode:
+    path: Path
+    length: int
+    success: bool
+
+
+def collect(inputs):
+    files = {}
+    for item in inputs:
+        candidate = item.resolve(strict=True)
+        if candidate.suffix == ".jsonl" and candidate.is_file():
+            for line in candidate.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                path = (candidate.parent / row["episode_file"]).resolve(strict=True)
+                if path in files and files[path] not in (None, row):
+                    raise ValueError(f"Conflicting index records: {path}")
+                files[path] = row
+        elif candidate.is_dir():
+            for path in candidate.rglob("*.hdf5"):
+                files.setdefault(path.resolve(strict=True), None)
+        elif candidate.suffix == ".hdf5":
+            files.setdefault(candidate, None)
+        else:
+            raise ValueError(f"Expected an HDF5 file, directory or episode JSONL: {candidate}")
+    if not files:
+        raise ValueError("No HDF5 episodes found")
     return files
 
 
-def read_raw_status(hdf5_path: Path) -> str:
-    with h5py.File(hdf5_path, "r") as handle:
-        if "meta" not in handle:
-            return "success"
-        source = handle["meta"].attrs.get("camera_source_episode_dir")
-    if isinstance(source, bytes):
-        source = source.decode()
-    if not source:
-        return "success"
-    meta_path = Path(str(source)) / "meta.json"
-    if not meta_path.is_file():
-        return "success"
-    try:
-        status = json.loads(meta_path.read_text(encoding="utf-8")).get("if_success")
-    except (OSError, json.JSONDecodeError):
-        return "success"
-    if isinstance(status, str) and status.strip():
-        return status.strip()
-    return "success"
+def read_episode(path, row, assume_success):
+    if SEGMENT_DATASETS.intersection(path.parts):
+        raise ValueError(f"{path} uses protected segment labels; use relabel_hdf5_segment_values.py")
+    with h5py.File(path, "r") as h:
+        if "value_label_segments_source" in h.attrs:
+            raise ValueError(f"{path} uses segment labels; use relabel_hdf5_segment_values.py")
+        lengths = {len(h[key]) for key in FRAME_KEYS if isinstance(h.get(key), h5py.Dataset)}
+        if len(lengths) != 1:
+            raise ValueError(f"Missing or inconsistent episode length: {path}: {lengths}")
+        length = lengths.pop()
+        if row and int(row["episode_length"]) != length:
+            raise ValueError(f"{path}: indexed length does not match stored frames")
+        for key in (VALUE_LABEL, REWARD_LABEL):
+            item = h.get(key)
+            if item is not None and not isinstance(item, h5py.Dataset):
+                raise ValueError(f"{path}: {key} is not a dataset")
+        status = next((h.attrs[k] for k in ("success", "if_success", "value_label_if_success") if k in h.attrs), None)
+        source = h["meta"].attrs.get("camera_source_episode_dir") if "meta" in h else None
+        if isinstance(source, bytes):
+            source = source.decode()
+    if row and "success" in row:
+        indexed_success = parse_success(row["success"])
+        if status is not None and parse_success(status) != indexed_success:
+            raise ValueError(f"{path}: index and HDF5 outcomes disagree")
+        status = indexed_success
+    if status is None:
+        for meta in [path.with_name("meta.json")] + ([Path(source) / "meta.json"] if source else []):
+            if meta.is_file():
+                fields = json.loads(meta.read_text(encoding="utf-8"))
+                status = fields.get("if_success", fields.get("success"))
+                if status is not None:
+                    break
+    if status is None and not assume_success:
+        raise ValueError(f"Missing episode outcome: {path}; use --assume-success only for known demos")
+    return Episode(path, length, parse_success(status) if status is not None else True)
 
 
-def value_labels(length: int, status: str) -> np.ndarray:
-    if status == FAIL_STATUS:
-        return np.full((length,), -1.0, dtype=np.float32)
-    if length <= 1:
-        return np.zeros((length,), dtype=np.float32)
-    timesteps = np.arange(length)
-    return (-(length - timesteps - 1) / (length - 1)).astype(np.float32)
+def write_episode(episode, scale):
+    values, rewards = scale.labels(episode.length, episode.success)
+    with h5py.File(episode.path, "r+") as h:
+        for key, values_to_write in ((VALUE_LABEL, values), (REWARD_LABEL, rewards)):
+            if key in h:
+                del h[key]
+            h.create_dataset(key, data=values_to_write)
+        h.attrs.setdefault("value_label_if_success", "success" if episode.success else "fail")
+        h.attrs.update(value_label_formula="clip(-(T-t)/Tmax - failure_cost_ratio*failed, -1, 0)",
+                       value_label_method=scale.metadata()["method"], value_label_tmax=scale.tmax,
+                       value_label_failure_cost_ratio=scale.failure_cost_ratio,
+                       value_label_failure_cost=scale.tmax * scale.failure_cost_ratio, value_label_gamma=1.0)
 
 
-def label_one(task: tuple[str, str]) -> dict:
-    hdf5_path = Path(task[0])
-    force_success = task[1] == "success"
-    try:
-        status = "success" if force_success else read_raw_status(hdf5_path)
-        with h5py.File(hdf5_path, "a") as handle:
-            if "action" in handle:
-                length = int(handle["action"].shape[0])
-            elif "observations/qpos" in handle:
-                length = int(handle["observations/qpos"].shape[0])
-            else:
-                length = int(handle["observation/camera/head"].shape[0])
-            labels = value_labels(length, status)
-            if "value_label" in handle:
-                del handle["value_label"]
-            handle.create_dataset("value_label", data=labels)
-            handle.attrs["value_label_if_success"] = status
-            handle.attrs["value_label_formula"] = "-(T-t-1)/(T-1)"
-        return {"path": str(hdf5_path), "status": status, "frames": length, "ok": True}
-    except Exception as err:
-        return {"path": str(hdf5_path), "ok": False, "error": f"{err}\n{traceback.format_exc()}"}
-
-
-def label_dataset(name: str, force_success: bool, num_workers: int) -> None:
-    files = iter_episode_hdf5(ROOT / name)
-    tasks = [(str(path), "success" if force_success else "raw") for path in files]
-    print(f"[START] {name} episodes={len(tasks)} force_success={force_success}", flush=True)
-    counts: dict[str, int] = {}
-    failed = 0
-    with Pool(processes=num_workers) as pool:
-        for done, result in enumerate(pool.imap_unordered(label_one, tasks, chunksize=4), start=1):
-            if not result["ok"]:
-                failed += 1
-                print(f"[FAIL] {result['path']}: {result['error']}", flush=True)
-            else:
-                counts[result["status"]] = counts.get(result["status"], 0) + 1
-            if done % 200 == 0 or done == len(tasks):
-                print(f"[PROGRESS] {name} {done}/{len(tasks)} failed={failed} status={counts}", flush=True)
-    print(f"[DONE] {name} failed={failed} status={counts}", flush=True)
-    if failed:
-        raise SystemExit(f"{name} had {failed} failed episodes")
-
-
-def main() -> None:
-    workers = 8
-    requested = sys.argv[1:]
-    if requested:
-        known = set(SUCCESS_DATASETS) | set(STATUS_DATASETS)
-        unknown = [name for name in requested if name not in known]
-        if unknown:
-            raise SystemExit(f"未知数据集: {unknown}")
-        for name in requested:
-            label_dataset(name, force_success=name in SUCCESS_DATASETS, num_workers=workers)
-        return
-    for name in SUCCESS_DATASETS:
-        label_dataset(name, force_success=True, num_workers=workers)
-    for name in STATUS_DATASETS:
-        label_dataset(name, force_success=False, num_workers=workers)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("inputs", nargs="*", type=Path, help="HDF5 episode files, directories, or JSONL indices")
+    parser.add_argument("--data_dir", "--data-dir", nargs="+", type=Path, default=[])
+    parser.add_argument("--failure-cost-ratio", type=float, default=DEFAULT_FAILURE_COST_RATIO)
+    parser.add_argument("--assume-success", action="store_true", help="Treat missing outcomes as successful demos")
+    parser.add_argument("--dry-run", action="store_true", help="Read and print the shared scale without writing")
+    args = parser.parse_args()
+    if not (args.inputs or args.data_dir):
+        parser.error("Provide all input datasets together so they share one Tmax")
+    episodes = [read_episode(p, row, args.assume_success) for p, row in collect(args.inputs + args.data_dir).items()]
+    scale = RecapLabelScale.from_lengths((ep.length for ep in episodes), args.failure_cost_ratio)
+    print(json.dumps(dict(scale.metadata(), episodes=len(episodes), frames=sum(ep.length for ep in episodes),
+                          failures=sum(not ep.success for ep in episodes), dry_run=args.dry_run)), flush=True)
+    if not args.dry_run:
+        for episode in episodes:
+            write_episode(episode, scale)
 
 
 if __name__ == "__main__":

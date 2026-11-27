@@ -222,18 +222,24 @@ loss = model.compute_loss(rng, observation, target_values, train=True)
 ### 步骤 1：添加价值标签
 
 ```bash
-python3 openpi/scripts/add_value_labels.py \
+python3 scripts/add_value_labels.py \
     --data_dir /public/home/wangsenbao_it/litianheng/lerobot_datasets/piper_plug_libero
 ```
 
-生成的 `value_label` 定义为：
+HDF5 可以一次传入多个数据目录或 train/val 的 JSONL 索引：
 
-$$
-value\_label = -(T - t) / T
-$$
+```bash
+python3 scripts/add_hdf5_value_labels.py \
+    --data_dir /path/to/episodes_train.jsonl /path/to/episodes_val.jsonl --dry-run
+```
 
-- 标签范围固定为 `[-1, 0]`
-- 当前训练脚本默认假设标签已经在这个范围内
+去掉 `--dry-run` 后，脚本原地替换 `value_label` 和 `reward_label`。把同一实验的全部数据一次传入，才能共享最长轨迹帧数 `Tmax`。成功或失败来自轨迹的明确结果；只有已知全部成功的示范数据才应使用 `--assume-success` 补齐缺失结果。独立分段训练请继续使用 `scripts/relabel_hdf5_segment_values.py`。
+
+设 `T` 为本轨迹的末帧下标，`t` 从 0 开始。默认 `C=0.3*Tmax`，可用 `--failure-cost-ratio` 调整：
+
+- 成功：`value_label = clip(-(T-t)/Tmax, -1, 0)`。
+- 失败：`value_label = clip((-(T-t)-C)/Tmax, -1, 0)`。
+- `reward_label`：普通帧 `-1/Tmax`，成功末帧 `0`，失败末帧 `-C/Tmax`。奖励不裁剪，必须与使用相同标签定义训练出的 VLM 一起计算优势。
 
 ### 步骤 2：仅训练集训练
 
