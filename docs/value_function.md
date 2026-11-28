@@ -235,11 +235,12 @@ python3 scripts/add_hdf5_value_labels.py \
 
 去掉 `--dry-run` 后，脚本原地替换 `value_label` 和 `reward_label`。把同一实验的全部数据一次传入，才能共享最长轨迹帧数 `Tmax`。成功或失败来自轨迹的明确结果；只有已知全部成功的示范数据才应使用 `--assume-success` 补齐缺失结果。独立分段训练请继续使用 `scripts/relabel_hdf5_segment_values.py`。
 
-设 `T` 为本轨迹的末帧下标，`t` 从 0 开始。默认 `C=0.3*Tmax`，可用 `--failure-cost-ratio` 调整：
+设 `T` 为本轨迹的末帧下标，`t` 从 0 开始，原始回报 `G=-(T-t)-C*failed`。两个脚本都支持：
 
-- 成功：`value_label = clip(-(T-t)/Tmax, -1, 0)`。
-- 失败：`value_label = clip((-(T-t)-C)/Tmax, -1, 0)`。
-- `reward_label`：普通帧 `-1/Tmax`，成功末帧 `0`，失败末帧 `-C/Tmax`。奖励不裁剪，必须与使用相同标签定义训练出的 VLM 一起计算优势。
+- `--normalization tmax-clip`（默认）：分母 `D=Tmax`，价值为 `clip(G/D, -1, 0)`，默认 `C=0.3*Tmax`。
+- `--normalization plus-c`：分母 `D=abs(min(G))`，最小回报取自全部输入，价值为 `G/D`，不裁剪，默认 `C=0.3*Tmax`。若最长轨迹失败，`D=Tmax-1+C`；若所有轨迹都只有一帧且原始回报均为零，则使用 `D=1`。
+
+`reward_label` 的普通帧是 `-1/D`，成功末帧是 `0`，失败末帧是 `-C/D`。两种模式都写入相同字段，对比时使用两份数据副本。可通过 `--failure-cost` 或 `--failure-cost-ratio` 覆盖默认惩罚。计算优势时应使用对应版本训练的 VLM 和对应的奖励。
 
 ### 步骤 2：仅训练集训练
 

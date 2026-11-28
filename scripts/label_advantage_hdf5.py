@@ -35,7 +35,7 @@ from openpi.training.agilex_hdf5_value_dataset import (
     read_barcodes,
     scan_episode_folders,
 )
-from openpi.training.recap_labels import METHOD as RECAP_LABEL_METHOD
+from openpi.training.recap_labels import FULL_FRAME_REWARD_METHODS
 
 LOG = logging.getLogger("openpi")
 EARLY_DATASETS = frozenset({
@@ -142,7 +142,7 @@ def _load_episode(folder: Path, lookahead: int) -> dict | None:
         if "reward_label" not in handle:
             raise ValueError(f"缺少 reward_label: {path}")
         reward = np.asarray(handle["reward_label"], dtype=np.float32)
-        uses_full_frame_rewards = handle.attrs.get("value_label_method") == RECAP_LABEL_METHOD
+        uses_full_frame_rewards = handle.attrs.get("value_label_method") in FULL_FRAME_REWARD_METHODS
         if "intervention" in handle:
             intervention = np.asarray(handle["intervention"], dtype=np.int64).reshape(-1)
         else:

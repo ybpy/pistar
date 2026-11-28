@@ -211,7 +211,12 @@ VLM value model 输入图像观测和任务文本，输出当前帧的价值估�
 python scripts/add_value_labels.py --data_dir /path/to/lerobot_datasets/libero_mixed_round1
 ```
 
-`Tmax` 是所有输入轨迹的最大帧数，在划分训练集和验证集之前统一统计。`T` 是本条轨迹的末帧下标，`t` 从 0 开始。默认 `C=0.3*Tmax`，成功标签为 `clip(-(T-t)/Tmax, -1, 0)`，失败标签为 `clip((-(T-t)-C)/Tmax, -1, 0)`。配套奖励为普通帧 `-1/Tmax`、成功末帧 `0`、失败末帧 `-0.3`。两列原地更新，`--dry-run` 可先检查且不写入。改过标签后请重新训练 VLM。
+`Tmax` 是划分训练集和验证集之前所有输入轨迹的最大帧数。`T` 是本条轨迹的末帧下标，`t` 从 0 开始。原始回报 `G=-(T-t)-C*failed`。
+
+- 默认 `--normalization tmax-clip`：`value_label=clip(G/Tmax, -1, 0)`，默认 `C=0.3*Tmax`。
+- `--normalization plus-c`：`value_label=G/abs(min(G))`，最小回报取自全部输入，不裁剪，默认 `C=0.3*Tmax`。若最长轨迹失败，分母为 `Tmax-1+C`。
+
+LeRobot 和 HDF5 脚本都支持这两个选项；奖励使用同一个分母。用 `--failure-cost` 指定绝对惩罚，或用 `--failure-cost-ratio` 指定相对 `Tmax` 的倍数。两列原地更新；对比时使用两份数据副本，或先用 `--dry-run` 查看分母。计算优势时使用对应版本训练的 VLM。
 
 ### 1. 训练 VLM value model
 

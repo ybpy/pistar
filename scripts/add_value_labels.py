@@ -1,4 +1,4 @@
-"""Recompute LeRobot value_label and reward_label with a shared corpus Tmax."""
+"""Recompute LeRobot value_label and reward_label using one corpus normalization."""
 
 import argparse
 from collections import defaultdict
@@ -10,10 +10,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from openpi.training.recap_labels import DEFAULT_FAILURE_COST_RATIO
 from openpi.training.recap_labels import REWARD_LABEL
 from openpi.training.recap_labels import VALUE_LABEL
 from openpi.training.recap_labels import RecapLabelScale
+from openpi.training.recap_labels import add_normalization_args
 from openpi.training.recap_labels import parse_success
 
 LEGACY = "value_lable"
@@ -99,13 +99,14 @@ def rewrite(path, value, reward):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data_dir", "--data-dir", required=True, nargs="+", type=Path)
-    parser.add_argument("--failure-cost-ratio", type=float, default=DEFAULT_FAILURE_COST_RATIO)
+    add_normalization_args(parser)
     parser.add_argument("--assume-success", action="store_true", help="Treat missing outcomes as successful demos")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     roots = tuple(dict.fromkeys(p.resolve(strict=True) for p in args.data_dir))
     jobs, episodes = scan(roots, args.assume_success)
-    scale = RecapLabelScale.from_lengths((length for length, _ in episodes.values()), args.failure_cost_ratio)
+    scale = RecapLabelScale.from_episodes(episodes.values(), normalization=args.normalization,
+                                         failure_cost=args.failure_cost, failure_cost_ratio=args.failure_cost_ratio)
     print(json.dumps(dict(scale.metadata(), episodes=len(episodes), files=len(jobs),
                           frames=sum(n for n, _ in episodes.values()), dry_run=args.dry_run)), flush=True)
     if args.dry_run:

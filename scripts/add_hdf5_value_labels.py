@@ -1,4 +1,4 @@
-"""Replace episode value_label and reward_label using a shared corpus Tmax."""
+"""Replace HDF5 value_label and reward_label using one corpus normalization."""
 
 import argparse
 from dataclasses import dataclass
@@ -7,10 +7,10 @@ from pathlib import Path
 
 import h5py
 
-from openpi.training.recap_labels import DEFAULT_FAILURE_COST_RATIO
 from openpi.training.recap_labels import REWARD_LABEL
 from openpi.training.recap_labels import VALUE_LABEL
 from openpi.training.recap_labels import RecapLabelScale
+from openpi.training.recap_labels import add_normalization_args
 from openpi.training.recap_labels import parse_success
 
 
@@ -100,24 +100,23 @@ def write_episode(episode, scale):
                 del h[key]
             h.create_dataset(key, data=values_to_write)
         h.attrs.setdefault("value_label_if_success", "success" if episode.success else "fail")
-        h.attrs.update(value_label_formula="clip(-(T-t)/Tmax - failure_cost_ratio*failed, -1, 0)",
-                       value_label_method=scale.metadata()["method"], value_label_tmax=scale.tmax,
-                       value_label_failure_cost_ratio=scale.failure_cost_ratio,
-                       value_label_failure_cost=scale.tmax * scale.failure_cost_ratio, value_label_gamma=1.0)
+        h.attrs.update({f"value_label_{key}": value for key, value in scale.metadata().items()})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="*", type=Path, help="HDF5 episode files, directories, or JSONL indices")
     parser.add_argument("--data_dir", "--data-dir", nargs="+", type=Path, default=[])
-    parser.add_argument("--failure-cost-ratio", type=float, default=DEFAULT_FAILURE_COST_RATIO)
+    add_normalization_args(parser)
     parser.add_argument("--assume-success", action="store_true", help="Treat missing outcomes as successful demos")
     parser.add_argument("--dry-run", action="store_true", help="Read and print the shared scale without writing")
     args = parser.parse_args()
     if not (args.inputs or args.data_dir):
-        parser.error("Provide all input datasets together so they share one Tmax")
+        parser.error("Provide all input datasets together so they share one normalization")
     episodes = [read_episode(p, row, args.assume_success) for p, row in collect(args.inputs + args.data_dir).items()]
-    scale = RecapLabelScale.from_lengths((ep.length for ep in episodes), args.failure_cost_ratio)
+    scale = RecapLabelScale.from_episodes(((ep.length, ep.success) for ep in episodes),
+                                         normalization=args.normalization, failure_cost=args.failure_cost,
+                                         failure_cost_ratio=args.failure_cost_ratio)
     print(json.dumps(dict(scale.metadata(), episodes=len(episodes), frames=sum(ep.length for ep in episodes),
                           failures=sum(not ep.success for ep in episodes), dry_run=args.dry_run)), flush=True)
     if not args.dry_run:

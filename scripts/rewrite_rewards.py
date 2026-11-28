@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 from openpi.shared import console
 from openpi.shared import progress
-from openpi.training.recap_labels import METHOD as RECAP_LABEL_METHOD
+from openpi.training.recap_labels import FULL_FRAME_REWARD_METHODS
 
 
 REWARD_COLUMN = "reward_label"
@@ -119,7 +119,7 @@ def rewrite_rewards_in_hdf5(hdf5_path: str) -> dict:
     path = Path(hdf5_path)
     try:
         with h5py.File(path, "a") as handle:
-            if handle.attrs.get("value_label_method") == RECAP_LABEL_METHOD:
+            if handle.attrs.get("value_label_method") in FULL_FRAME_REWARD_METHODS:
                 raise ValueError("Use add_hdf5_value_labels.py to regenerate paired RECAP rewards")
             if VALUE_LABEL_COLUMN not in handle:
                 raise ValueError(f"缺少 {VALUE_LABEL_COLUMN}")

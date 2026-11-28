@@ -228,12 +228,12 @@ Before training, replace both labels on the merged dataset:
 python scripts/add_value_labels.py --data_dir /path/to/lerobot_datasets/libero_mixed_round1
 ```
 
-`Tmax` is the longest episode in frames across all supplied data, before the train/validation split. With zero-based frame `t` and episode last frame `T`, the value is `clip(-(T-t)/Tmax - 0.3 * failed, -1, 0)`.
+`Tmax` is the longest episode in frames across all supplied data, before the train/validation split. Let `G = -(T-t) - C * failed` be the raw return, with frame `t` and last frame `T` both zero-based.
 
-- For successful episodes, `reward_label` is `-1 / Tmax` for non-terminal frames and `0` for the last frame.
-- For failed episodes, non-terminal rewards are also `-1 / Tmax`, and the last frame defaults to `-0.3`.
+- `--normalization tmax-clip` (default): `value_label = clip(G / Tmax, -1, 0)`, with `C = 0.3 * Tmax` by default. Non-terminal rewards are `-1 / Tmax`; the terminal reward is `0` for success and `-0.3` by default for failure.
+- `--normalization plus-c`: `value_label = G / abs(min(G))` with no clipping and `C = 0.3 * Tmax` by default. The minimum is taken over the whole corpus. If the longest episode fails, the divisor is `Tmax - 1 + C`. The rewards use that same divisor.
 
-Clipping applies only to the value targets. Pass `--failure-cost-ratio` to change 0.3, or `--dry-run` to inspect the scale before replacing labels. Train a new VLM checkpoint after changing the rewards or labels.
+Both the LeRobot script above and `scripts/add_hdf5_value_labels.py` accept these modes. Use `--failure-cost` for an absolute penalty or `--failure-cost-ratio` for a multiple of `Tmax`. Each run replaces `value_label` and `reward_label`; use separate dataset copies to compare modes, and use `--dry-run` to inspect the divisor before writing. Use a VLM checkpoint trained with the same labels when computing advantages.
 
 ### 1. Train the VLM value model
 
